@@ -1,0 +1,13 @@
+[Unit]
+Description=Clean Speech Microphone Filter Daemon
+After=pipewire.service pipewire-pulse.service pulseaudio.service sound.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/caleb/clean-speech-daemon
+ExecStart=/home/caleb/clean-speech-daemon/.venv/bin/clean-speech-daemon run --config /home/caleb/clean-speech-daemon/profiles/nlms-aec.toml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

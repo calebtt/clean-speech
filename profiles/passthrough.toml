@@ -1,0 +1,54 @@
+[input]
+microphone = "JLab Go Cam"
+system_audio_reference = "off"
+sample_rate = 48000
+channels = 1
+frame_ms = 20
+
+[processing]
+mode = "passthrough"
+max_latency_ms = 0
+enable_highpass = false
+enable_reference_delay_align = false
+reference_delay_mode = "manual"
+reference_delay_ms = 0
+reference_max_delay_ms = 500
+reference_delay_smoothing = 0.85
+enable_reference_level_match = false
+enable_echo_cancellation = false
+enable_noise_suppression = false
+enable_vad = false
+enable_speech_enhancement = false
+noise_reduction = 0.0
+spectral_floor = 1.0
+reference_gain_min = 0.05
+reference_gain_max = 20.0
+reference_gain_smoothing = 0.92
+reference_target_ratio = 1.0
+output_when_no_speech = "attenuate"
+silence_attenuation = 1.0
+
+[vad]
+threshold = 0.52
+pre_roll_ms = 0
+post_roll_ms = 0
+noise_learn_ms = 800
+
+[output]
+pipewire_virtual_source = true
+auto_load_pulse_pipe_source = true
+pulse_source_name = "clean_speech_microphone"
+pulse_source_description = "Clean Speech Microphone"
+fifo_path = "/tmp/clean-speech-daemon.pcm"
+socket_path = "/tmp/clean-speech-daemon.sock"
+streams_socket_path = "/tmp/clean-speech-daemon-streams.sock"
+debug_wav_path = ""
+
+[diagnostics]
+enabled = true
+log_path = "/tmp/clean-speech-daemon-diagnostics.jsonl"
+status_path = "/tmp/clean-speech-daemon-status.json"
+interval_ms = 1000
+enable_stage_wavs = false
+stage_wav_dir = "/tmp/clean-speech-daemon-stages"
+print_interval_ms = 5000
