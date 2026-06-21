@@ -22,9 +22,9 @@ class ProcessingConfig:
     mode: str = "quality"
     max_latency_ms: int = 1500
     enable_highpass: bool = True
-    enable_reference_delay_align: bool = False
+    enable_reference_delay_align: bool = True
     reference_delay_mode: str = "manual"
-    reference_delay_ms: int = 120
+    reference_delay_ms: int = 25
     reference_max_delay_ms: int = 500
     reference_delay_smoothing: float = 0.85
     enable_reference_level_match: bool = False
@@ -34,6 +34,8 @@ class ProcessingConfig:
     echo_step_size: float = 0.3
     echo_filter_leak: float = 1e-4
     echo_boundary_smoothing_samples: int = 64
+    echo_step_size_warmup: float = 0.3
+    echo_warmup_frames: int = 150
     # Reference jitter-buffer latency. Must be SMALLER than the acoustic echo delay
     # (monitor tap -> speaker -> mic), otherwise the reference arrives later than
     # the echo and a causal filter cannot cancel it. The adaptive filter then
@@ -143,9 +145,9 @@ frame_ms = 20
 mode = "quality"
 max_latency_ms = 1500
 enable_highpass = true
-enable_reference_delay_align = false
+enable_reference_delay_align = true
 reference_delay_mode = "manual"
-reference_delay_ms = 120
+reference_delay_ms = 25
 reference_max_delay_ms = 500
 reference_delay_smoothing = 0.85
 enable_reference_level_match = false
@@ -155,9 +157,11 @@ echo_filter_taps = 4096
 echo_step_size = 0.1
 echo_filter_leak = 0.0001
 echo_boundary_smoothing_samples = 64
+echo_step_size_warmup = 0.3
+echo_warmup_frames = 150
 reference_sync_latency_frames = 1.0
 reference_drift_compensation = false
-mic_delay_ms = 60
+mic_delay_ms = 0
 enable_noise_suppression = true
 enable_vad = true
 enable_speech_enhancement = true

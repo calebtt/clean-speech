@@ -57,10 +57,15 @@ class NlmsEchoCanceller:
         regularization: float = 1.0,
         silence_floor: float = 1e-7,
         boundary_smoothing_samples: int = 64,
+        step_size_warmup: float | None = None,
+        warmup_frames: int = 150,
     ) -> None:
         self.block = int(frame_samples)
         self.taps = max(1, int(taps))
         self.mu = float(step_size)
+        self.mu_warmup = float(step_size if step_size_warmup is None else step_size_warmup)
+        self.warmup_frames = max(1, int(warmup_frames))
+        self.adapt_frames = 0
         self.leak = float(leak)
         self.power_smoothing = float(np.clip(power_smoothing, 0.0, 0.999))
         # Regularization as a multiple of the mean reference power -- this is what
@@ -113,7 +118,10 @@ class NlmsEchoCanceller:
             error_block = np.zeros(self.fft_size, dtype=np.float64)
             error_block[-self.block :] = error
             E = np.fft.rfft(error_block)
-            update = (self.mu / (self.power + reg)) * (np.conj(X) * E)
+            ramp = min(1.0, self.adapt_frames / float(self.warmup_frames))
+            mu = self.mu_warmup + (self.mu - self.mu_warmup) * ramp
+            self.adapt_frames += 1
+            update = (mu / (self.power + reg)) * (np.conj(X) * E)
             self.weights = (1.0 - self.leak) * self.weights + update
 
             # Gradient constraint: keep the filter to `taps` samples.
@@ -154,5 +162,7 @@ def make_echo_canceller(config, frame_samples: int):  # noqa: ANN001
             step_size=float(getattr(config.processing, "echo_step_size", 0.3)),
             leak=float(getattr(config.processing, "echo_filter_leak", 1e-4)),
             boundary_smoothing_samples=int(getattr(config.processing, "echo_boundary_smoothing_samples", 64)),
+            step_size_warmup=float(getattr(config.processing, "echo_step_size_warmup", 0.3)),
+            warmup_frames=int(getattr(config.processing, "echo_warmup_frames", 150)),
         )
     return AdaptiveEchoReducer()

@@ -202,9 +202,10 @@ class EchoCancellationTests(unittest.TestCase):
 
     def test_manual_delay_aligner_returns_delayed_reference_frame(self) -> None:
         aligner = ReferenceDelayAligner(
-            frame_ms=FRAME_MS,
-            initial_delay_ms=FRAME_MS * 3,
-            max_delay_ms=FRAME_MS * 8,
+            SAMPLE_RATE,
+            FRAME_SAMPLES,
+            FRAME_MS * 3,
+            FRAME_MS * 8,
             smoothing=0.0,
             mode="manual",
         )
@@ -213,8 +214,8 @@ class EchoCancellationTests(unittest.TestCase):
 
         outputs = [aligner.process(mic, frame) for frame in reference_frames]
 
-        np.testing.assert_allclose(outputs[5], reference_frames[2], atol=1e-7)
-        self.assertEqual(aligner.delay_ms, FRAME_MS * 3)
+        np.testing.assert_allclose(outputs[5], reference_frames[2], atol=1e-5)
+        self.assertAlmostEqual(aligner.delay_ms, FRAME_MS * 3, delta=0.5)
 
     def test_alignment_report_detects_known_reference_offset(self) -> None:
         testbed = load_testbed_module()

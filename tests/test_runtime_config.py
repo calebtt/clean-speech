@@ -30,8 +30,9 @@ class RuntimeConfigRegressionTests(unittest.TestCase):
         config = Config()
 
         self.assertEqual(config.processing.echo_canceller, "nlms")
-        self.assertFalse(config.processing.enable_reference_delay_align)
+        self.assertTrue(config.processing.enable_reference_delay_align)
         self.assertFalse(config.processing.enable_reference_level_match)
+        self.assertEqual(config.processing.mic_delay_ms, 0)
         self.assertGreaterEqual(config.processing.echo_filter_taps, 512)
 
     def test_old_config_without_echo_canceller_still_uses_nlms(self) -> None:

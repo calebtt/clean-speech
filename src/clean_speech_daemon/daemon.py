@@ -137,13 +137,14 @@ class CleanSpeechDaemon:
                     ref_data = self.ref_sync.pull()
 
                 cleaned = self.pipeline.process(mic_frame.data, ref_data)
+                stages = self.pipeline.last_stages
                 self.socket_output.write(cleaned)
                 self.streams_output.write(
-                    mic_frame.data,
+                    stages.get("mic_raw", mic_frame.data),
                     ref_data,
-                    self.pipeline.last_stages.get("reference_aligned"),
-                    self.pipeline.last_stages.get("reference_matched"),
-                    self.pipeline.last_stages.get("after_echo"),
+                    stages.get("reference_aligned"),
+                    stages.get("reference_matched"),
+                    stages.get("after_echo"),
                     cleaned,
                 )
                 self.fifo_output.write(cleaned)
@@ -152,7 +153,7 @@ class CleanSpeechDaemon:
                     self.stage_wavs.write(self.pipeline.last_stages)
 
                 if self.config.diagnostics.enabled:
-                    self._write_diagnostics(mic_frame.data, ref_data, cleaned)
+                    self._write_diagnostics(stages, ref_data, cleaned)
 
                 now = time.monotonic()
                 if now - last_stats >= 5.0:
@@ -165,8 +166,11 @@ class CleanSpeechDaemon:
                     )
                     last_stats = now
 
-    def _write_diagnostics(self, mic, reference, cleaned) -> None:  # noqa: ANN001
+    def _write_diagnostics(self, stages, reference, cleaned) -> None:  # noqa: ANN001
         stats = self.pipeline.stats
+        mic = stages.get("hardware_mic")
+        mic_to_aec = stages.get("mic_raw")
+        after_echo = stages.get("after_echo")
         self.diagnostics.maybe_write(
             {
                 "config": {
@@ -203,10 +207,12 @@ class CleanSpeechDaemon:
                     "reference_target_ratio": self.config.processing.reference_target_ratio,
                 },
                 "mic": audio_metrics(mic),
+                "mic_to_aec": audio_metrics(mic_to_aec),
                 "reference": audio_metrics(reference),
                 "output": audio_metrics(cleaned),
-                "stages": {name: audio_metrics(frame) for name, frame in self.pipeline.last_stages.items()},
-                "reference_correlation": correlation(mic, reference),
+                "stages": {name: audio_metrics(frame) for name, frame in stages.items()},
+                "reference_correlation": correlation(mic_to_aec, reference),
+                "residual_ref_correlation": correlation(after_echo, reference),
                 "pipeline": {
                     "frames": stats.frames,
                     "speech_frames": stats.speech_frames,
@@ -218,6 +224,7 @@ class CleanSpeechDaemon:
                     "reference_gain": stats.reference_gain,
                     "reference_delay_ms": stats.reference_delay_ms,
                     "reference_delay_correlation": stats.reference_delay_correlation,
+                    "residual_ref_correlation": stats.residual_ref_correlation,
                     "ref_present": stats.ref_present,
                     "clipped_output_pct": stats.clipped_output_pct,
                 },

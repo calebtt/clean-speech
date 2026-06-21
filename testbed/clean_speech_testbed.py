@@ -183,6 +183,7 @@ class CleanSpeechTestbed(tk.Tk):
         self.level_var = tk.DoubleVar(value=0.0)
         self.peak_var = tk.DoubleVar(value=0.0)
         self.play_var = tk.BooleanVar(value=False)
+        self.play_stream_var = tk.StringVar(value="cleaned_output")
         self.frames_var = tk.StringVar(value="Frames: 0")
         self.buffer_var = tk.StringVar(value=f"In-memory buffer: last {BUFFER_SECONDS}s, not saving to disk")
         self.diagnostics_var = tk.StringVar(value="Diagnostics: waiting for daemon status file")
@@ -229,7 +230,15 @@ class CleanSpeechTestbed(tk.Tk):
 
         controls = ttk.LabelFrame(outer, text="Test Controls", padding=10)
         controls.pack(fill=tk.X, pady=(12, 0))
-        ttk.Checkbutton(controls, text="Play cleaned stream", variable=self.play_var, command=self._toggle_playback).pack(side=tk.LEFT)
+        ttk.Checkbutton(controls, text="Play stream", variable=self.play_var, command=self._toggle_playback).pack(side=tk.LEFT)
+        play_menu = ttk.Combobox(
+            controls,
+            textvariable=self.play_stream_var,
+            values=("cleaned_output", "after_echo"),
+            state="readonly",
+            width=16,
+        )
+        play_menu.pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(controls, text="Save Streams", command=self.save_streams).pack(side=tk.LEFT, padx=8)
         ttk.Button(controls, text="Choose Save Folder", command=self.choose_record_dir).pack(side=tk.LEFT)
         ttk.Button(controls, text="Clear Buffer", command=self.clear_buffer).pack(side=tk.RIGHT)
@@ -308,7 +317,10 @@ class CleanSpeechTestbed(tk.Tk):
             for name in STREAM_NAMES:
                 self.buffers[name].append(packet.streams[name].copy())
             if self.play_var.get():
-                self.playback.write(packet.streams["cleaned_output"])
+                stream_name = self.play_stream_var.get()
+                if stream_name not in packet.streams:
+                    stream_name = "cleaned_output"
+                self.playback.write(packet.streams[stream_name])
 
         if latest is not None:
             cleaned = latest.metrics["cleaned_output"]
@@ -362,7 +374,8 @@ class CleanSpeechTestbed(tk.Tk):
                 f"delay corr {fmt_float(pipeline.get('reference_delay_correlation'))}, "
                 f"ref gain {fmt_float(pipeline.get('reference_gain'))}, "
                 f"echo gain {fmt_float(pipeline.get('echo_gain'))}, "
-                f"ref corr {fmt_float(payload.get('reference_correlation'))}\n"
+                f"ref corr {fmt_float(payload.get('reference_correlation'))}, "
+                f"residual ref corr {fmt_float(pipeline.get('residual_ref_correlation', payload.get('residual_ref_correlation')))}\n"
                 f"AEC: backend={config.get('echo_canceller')} "
                 f"taps={config.get('echo_filter_taps')} "
                 f"step={config.get('echo_step_size')} "
@@ -487,6 +500,22 @@ def alignment_report(streams: dict[str, np.ndarray]) -> dict[str, object]:
             "likely_output_delay_ms": max(0, -offset_ms) if name == "cleaned_output" else None,
         }
     report["offsets_vs_mic_raw"] = offsets
+    ref = streams.get("system_reference")
+    after_echo = streams.get("after_echo")
+    if ref is not None and after_echo is not None and len(ref) == len(after_echo):
+        warmup = min(len(ref), 48_000 * 4)
+        ref_seg = ref[warmup:]
+        mic_seg = mic[warmup:] if mic is not None and len(mic) > warmup else None
+        echo_seg = after_echo[warmup:]
+        mic_ref = abs(estimate_offset_samples(mic_seg, ref_seg)[1]) if mic_seg is not None else 0.0
+        residual = abs(estimate_offset_samples(echo_seg, ref_seg)[1])
+        echo_rms = float(np.sqrt(np.mean(echo_seg * echo_seg)) + 1e-12)
+        mic_rms = float(np.sqrt(np.mean(mic_seg * mic_seg)) + 1e-12) if mic_seg is not None else echo_rms
+        report["echo_metrics"] = {
+            "mic_vs_reference_correlation": mic_ref,
+            "after_echo_vs_reference_correlation": residual,
+            "echo_reduction_db": 20.0 * float(np.log10(echo_rms / max(mic_rms, 1e-12))),
+        }
     return report
 
 
