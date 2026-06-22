@@ -7,6 +7,7 @@ import numpy as np
 
 from .aec import make_echo_canceller
 from .config import Config
+from .delay_align import GccPhatDelayEstimator
 
 
 @dataclass(slots=True)
@@ -20,6 +21,8 @@ class ProcessingStats:
     reference_gain: float = 1.0
     reference_delay_ms: float = 0.0
     reference_delay_correlation: float = 0.0
+    reference_delay_confidence: float = 0.0
+    reference_cancellation_score: float = 1.0
     residual_ref_correlation: float = 0.0
     ref_present: bool = False
     clipped_output_pct: float = 0.0
@@ -91,10 +94,9 @@ class ReferenceLevelMatcher:
 class SampleReferenceDelayAligner:
     """Fractional-sample reference delay for echo cancellation.
 
-    Frame-quantized delay (20 ms steps) misaligns the reference with the echo
-    component in the mic by tens of milliseconds. This aligner keeps a rolling
-    reference buffer and reads delayed frames with ``np.interp`` so manual and
-    auto modes can land on sub-frame offsets.
+    Manual mode uses a fixed delay. Auto and calibrate modes run a rolling
+    GCC-PHAT estimator (see :mod:`delay_align`) on ref-active windows, then read
+    the delayed reference with ``np.interp`` for sub-frame precision.
     """
 
     def __init__(
@@ -105,6 +107,14 @@ class SampleReferenceDelayAligner:
         max_delay_ms: int,
         smoothing: float,
         mode: str,
+        window_ms: float = 300.0,
+        min_ref_rms: float = 0.003,
+        min_confidence: float = 0.15,
+        median_frames: int = 15,
+        calibrate_seconds: float = 10.0,
+        cancellation_aware: bool = True,
+        fine_tune_ms: float = 15.0,
+        target_residual_corr: float = 0.15,
     ) -> None:
         self.sample_rate = int(sample_rate)
         self.frame_samples = int(frame_samples)
@@ -116,7 +126,44 @@ class SampleReferenceDelayAligner:
         self.history: deque[np.ndarray] = deque()
         self.max_history_samples = self.max_delay_samples + self.frame_samples + 1
         self.correlation = 0.0
-        self._search_step = max(1, self.sample_rate // 1000)  # ~1 ms
+        self.confidence = 0.0
+        self._estimator = GccPhatDelayEstimator(
+            sample_rate,
+            frame_samples,
+            float(max_delay_ms),
+            window_ms=window_ms,
+            min_ref_rms=min_ref_rms,
+            min_confidence=min_confidence,
+            median_frames=median_frames,
+            smoothing=smoothing,
+            calibrate_seconds=calibrate_seconds,
+            mode=mode,
+            cancellation_aware=cancellation_aware,
+            fine_tune_ms=fine_tune_ms,
+            target_residual_corr=target_residual_corr,
+        )
+        self._estimator.delay_samples = self.manual_delay_samples
+
+    @property
+    def cancellation_score(self) -> float:
+        return self._estimator.cancellation_score
+
+    def observe_residual(self, after_echo: np.ndarray, aligned_ref: np.ndarray) -> bool:
+        return self._estimator.observe_residual(after_echo, aligned_ref)
+
+    def set_tuning(self, *, delay_ms: float | None = None, mode: str | None = None) -> None:
+        if delay_ms is not None:
+            self.manual_delay_samples = max(
+                0.0,
+                min(float(self.sample_rate * delay_ms / 1000), float(self.max_delay_samples)),
+            )
+            self.delay_samples = self.manual_delay_samples
+            self._estimator.delay_samples = self.manual_delay_samples
+        if mode is not None:
+            self.mode = mode
+            self._estimator.mode = mode
+            if mode == "manual":
+                self.delay_samples = self.manual_delay_samples
 
     @property
     def delay_ms(self) -> float:
@@ -156,22 +203,13 @@ class SampleReferenceDelayAligner:
             if selected is None:
                 return reference
             self.correlation = normalized_correlation(mic, selected)
+            self.confidence = abs(self.correlation)
             return selected
 
-        best_delay = 0.0
-        best_corr = -1.0
-        for lag in range(0, self.max_delay_samples + 1, self._search_step):
-            candidate = self._read_delayed(float(lag))
-            if candidate is None or len(candidate) != len(mic):
-                continue
-            corr = abs(normalized_correlation(mic, candidate))
-            if corr > best_corr:
-                best_corr = corr
-                best_delay = float(lag)
-
-        smoothed = self.smoothing * self.delay_samples + (1.0 - self.smoothing) * best_delay
-        self.delay_samples = float(np.clip(smoothed, 0.0, float(self.max_delay_samples)))
-        self.correlation = max(0.0, best_corr)
+        delay, corr, conf = self._estimator.update(mic, reference)
+        self.delay_samples = delay
+        self.correlation = corr
+        self.confidence = conf
         selected = self._read_delayed(self.delay_samples)
         return selected if selected is not None else reference
 
@@ -317,6 +355,14 @@ class ProcessingPipeline:
             config.processing.reference_max_delay_ms,
             config.processing.reference_delay_smoothing,
             config.processing.reference_delay_mode,
+            window_ms=float(config.processing.delay_window_ms),
+            min_ref_rms=float(config.processing.delay_update_min_ref_rms),
+            min_confidence=float(config.processing.delay_min_confidence),
+            median_frames=int(config.processing.delay_median_frames),
+            calibrate_seconds=float(config.processing.delay_calibrate_seconds),
+            cancellation_aware=bool(config.processing.delay_cancellation_aware),
+            fine_tune_ms=float(config.processing.delay_fine_tune_ms),
+            target_residual_corr=float(config.processing.delay_target_residual_corr),
         )
         self.reference_matcher = ReferenceLevelMatcher(
             config.processing.reference_gain_min,
@@ -378,6 +424,14 @@ class ProcessingPipeline:
             frame = self.echo.process(frame, matched_reference)
         stages["after_echo"] = frame.copy()
 
+        if (
+            self.config.processing.enable_reference_delay_align
+            and self.config.processing.reference_delay_mode in ("auto", "calibrate")
+            and matched_reference is not None
+        ):
+            if self.reference_aligner.observe_residual(stages["after_echo"], matched_reference):
+                self.reset_echo_filter()
+
         if self.config.processing.enable_highpass:
             frame = self.highpass.process(frame)
         stages["after_highpass"] = frame.copy()
@@ -408,9 +462,13 @@ class ProcessingPipeline:
         if self.config.processing.enable_reference_delay_align:
             self.stats.reference_delay_ms = self.reference_aligner.delay_ms
             self.stats.reference_delay_correlation = self.reference_aligner.correlation
+            self.stats.reference_delay_confidence = self.reference_aligner.confidence
+            self.stats.reference_cancellation_score = self.reference_aligner.cancellation_score
         else:
             self.stats.reference_delay_ms = 0.0
             self.stats.reference_delay_correlation = 0.0
+            self.stats.reference_delay_confidence = 0.0
+            self.stats.reference_cancellation_score = 1.0
         after_echo = stages.get("after_echo")
         if after_echo is not None and matched_reference is not None and len(after_echo) == len(matched_reference):
             self.stats.residual_ref_correlation = normalized_correlation(after_echo, matched_reference)
@@ -419,3 +477,36 @@ class ProcessingPipeline:
         self.stats.ref_present = reference is not None
         self.stats.clipped_output_pct = float(np.mean(np.abs(frame) >= 0.98) * 100.0)
         return clipped
+
+    def apply_tuning(
+        self,
+        *,
+        reference_delay_ms: float | None = None,
+        reference_delay_mode: str | None = None,
+        mic_delay_ms: float | None = None,
+    ) -> dict[str, float | str]:
+        applied: dict[str, float | str] = {}
+        if reference_delay_ms is not None:
+            self.config.processing.reference_delay_ms = int(round(reference_delay_ms))
+            self.reference_aligner.set_tuning(delay_ms=float(reference_delay_ms))
+            applied["reference_delay_ms"] = float(reference_delay_ms)
+        if reference_delay_mode is not None:
+            self.config.processing.reference_delay_mode = reference_delay_mode
+            self.reference_aligner.set_tuning(mode=reference_delay_mode)
+            applied["reference_delay_mode"] = reference_delay_mode
+        if mic_delay_ms is not None:
+            sample_rate = int(self.config.input.sample_rate)
+            samples = max(0, int(sample_rate * float(mic_delay_ms) / 1000))
+            self.config.processing.mic_delay_ms = int(round(mic_delay_ms))
+            if samples != self.mic_delay_samples:
+                self.mic_delay_samples = samples
+                self.mic_delay_buffer = np.zeros(samples, dtype=np.float32)
+            applied["mic_delay_ms"] = float(mic_delay_ms)
+        return applied
+
+    def reset_echo_filter(self) -> None:
+        reset = getattr(self.echo, "reset", None)
+        if callable(reset):
+            reset()
+        else:
+            self.echo.gain = 0.0

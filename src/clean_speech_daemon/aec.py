@@ -149,6 +149,15 @@ class NlmsEchoCanceller:
 
         return np.nan_to_num(error).astype(np.float32)
 
+    def reset(self) -> None:
+        self.weights.fill(0.0)
+        self.ref_buffer.fill(0.0)
+        self.power.fill(1e-3)
+        self.gain = 0.0
+        self.adapt_frames = 0
+        self.adapting = False
+        self.previous_output_last = None
+
 
 def make_echo_canceller(config, frame_samples: int):  # noqa: ANN001
     """Build the configured echo canceller. Falls back to the scalar reducer."""
@@ -164,5 +173,15 @@ def make_echo_canceller(config, frame_samples: int):  # noqa: ANN001
             boundary_smoothing_samples=int(getattr(config.processing, "echo_boundary_smoothing_samples", 64)),
             step_size_warmup=float(getattr(config.processing, "echo_step_size_warmup", 0.3)),
             warmup_frames=int(getattr(config.processing, "echo_warmup_frames", 150)),
+        )
+    if kind in ("dtln", "nkf", "hybrid"):
+        # Neural cancellers (16 kHz models wrapped for the 48 kHz realtime loop).
+        from .neural_aec import NeuralEchoCanceller
+
+        return NeuralEchoCanceller(
+            kind,
+            frame_samples,
+            sample_rate=int(config.input.sample_rate),
+            mask_smooth=float(getattr(config.processing, "dtln_mask_smoothing", 0.6)),
         )
     return AdaptiveEchoReducer()

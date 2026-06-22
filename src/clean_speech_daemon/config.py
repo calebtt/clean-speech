@@ -23,14 +23,41 @@ class ProcessingConfig:
     max_latency_ms: int = 1500
     enable_highpass: bool = True
     enable_reference_delay_align: bool = True
+    # Manual is the validated default: the auto GCC-PHAT aligner wanders frame to
+    # frame and resets the NLMS filter on every change (see ProcessingPipeline),
+    # which prevents convergence. With a generous mic_delay (below) the reference
+    # leads the echo and the adaptive filter's taps absorb the residual delay, so a
+    # fixed delay of 0 cancels across sessions. Re-enable auto only once the aligner
+    # no longer resets/diverges.
     reference_delay_mode: str = "manual"
-    reference_delay_ms: int = 25
-    reference_max_delay_ms: int = 500
+    reference_delay_ms: int = 0
+    # Clamp the auto search band near the real echo delay (~19 ms measured) so it
+    # cannot lock onto spurious 100-400 ms peaks. Only used in auto mode.
+    reference_max_delay_ms: int = 40
     reference_delay_smoothing: float = 0.85
+    delay_window_ms: float = 300.0
+    delay_update_min_ref_rms: float = 0.003
+    delay_min_confidence: float = 0.15
+    delay_median_frames: int = 15
+    delay_calibrate_seconds: float = 10.0
+    delay_cancellation_aware: bool = True
+    delay_fine_tune_ms: float = 15.0
+    delay_target_residual_corr: float = 0.15
     enable_reference_level_match: bool = False
     enable_echo_cancellation: bool = True
-    echo_canceller: str = "nlms"  # "scalar" (legacy) | "nlms" (adaptive FIR)
-    echo_filter_taps: int = 512
+    # "scalar" (legacy) | "nlms" (adaptive FIR) | neural 16 kHz models:
+    #   "dtln"   deep non-linear cancellation, can warble on speech
+    #   "nkf"    linear neural Kalman, artifact-free but shallow
+    #   "hybrid" NKF->DTLN, deep cancellation with the voice kept clear (recommended)
+    echo_canceller: str = "nlms"
+    dtln_mask_smoothing: float = 0.6  # neural DTLN temporal mask smoothing (less warble)
+    echo_filter_taps: int = 4096  # ~85 ms at 48 kHz; long enough for the room tail
+    # 0.3 adapts fast enough to remove most of an echo-dominant capture (validated:
+    # ~6 dB / 77% of the energy on a real recording, near the ceiling set by the
+    # mic's non-linear distortion). Lower values (0.05) under-adapt and leave the
+    # echo in. The cost is that a high step also subtracts near-end speech during
+    # double-talk -- the proper fix for that is double-talk detection (freeze
+    # adaptation while the user speaks), not a permanently low step.
     echo_step_size: float = 0.3
     echo_filter_leak: float = 1e-4
     echo_boundary_smoothing_samples: int = 64
@@ -46,10 +73,13 @@ class ProcessingConfig:
     # synchronous, and resampling only warps the reference and breaks cancellation.
     reference_drift_compensation: bool = False
     # Delay the mic into the canceller so the (jitter-buffered) reference reliably
-    # leads the echo, keeping the adaptive filter causal. Needed when the reference
-    # sync latency is comparable to or larger than the acoustic echo delay. Adds
-    # this much output latency.
-    mic_delay_ms: int = 0
+    # leads the echo, keeping the adaptive filter causal. This is the primary AEC
+    # fix: measured sessions showed the parec monitor reference arriving 16-29 ms
+    # AFTER the echo in the mic (capture latency exceeds the acoustic delay), making
+    # cancellation non-causal -- a causal FIR cannot subtract a sound it has not yet
+    # received. 60 ms covers the observed lateness plus margin; the NLMS taps then
+    # model the residual lead. Adds this much output latency.
+    mic_delay_ms: int = 60
     enable_noise_suppression: bool = True
     enable_vad: bool = True
     enable_speech_enhancement: bool = True
@@ -80,6 +110,7 @@ class OutputConfig:
     fifo_path: str = "/tmp/clean-speech-daemon.pcm"
     socket_path: str = "/tmp/clean-speech-daemon.sock"
     streams_socket_path: str = "/tmp/clean-speech-daemon-streams.sock"
+    control_socket_path: str = "/tmp/clean-speech-daemon-control.sock"
     debug_wav_path: str = ""
 
 
@@ -147,21 +178,29 @@ max_latency_ms = 1500
 enable_highpass = true
 enable_reference_delay_align = true
 reference_delay_mode = "manual"
-reference_delay_ms = 25
-reference_max_delay_ms = 500
+reference_delay_ms = 0
+reference_max_delay_ms = 40
 reference_delay_smoothing = 0.85
+delay_window_ms = 300
+delay_update_min_ref_rms = 0.003
+delay_min_confidence = 0.15
+delay_median_frames = 15
+delay_calibrate_seconds = 10
+delay_cancellation_aware = true
+delay_fine_tune_ms = 15
+delay_target_residual_corr = 0.15
 enable_reference_level_match = false
 enable_echo_cancellation = true
 echo_canceller = "nlms"
 echo_filter_taps = 4096
-echo_step_size = 0.1
+echo_step_size = 0.3
 echo_filter_leak = 0.0001
 echo_boundary_smoothing_samples = 64
 echo_step_size_warmup = 0.3
 echo_warmup_frames = 150
 reference_sync_latency_frames = 1.0
 reference_drift_compensation = false
-mic_delay_ms = 0
+mic_delay_ms = 60
 enable_noise_suppression = true
 enable_vad = true
 enable_speech_enhancement = true
@@ -188,6 +227,7 @@ pulse_source_description = "Clean Speech Microphone"
 fifo_path = "/tmp/clean-speech-daemon.pcm"
 socket_path = "/tmp/clean-speech-daemon.sock"
 streams_socket_path = "/tmp/clean-speech-daemon-streams.sock"
+control_socket_path = "/tmp/clean-speech-daemon-control.sock"
 debug_wav_path = ""
 
 [diagnostics]

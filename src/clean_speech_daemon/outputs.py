@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections import deque
 import errno
 import json
 import os
@@ -20,12 +21,66 @@ from .audio import pcm16_bytes
 MULTI_STREAM_NAMES = ["mic_raw", "system_reference", "reference_aligned", "reference_matched", "after_echo", "cleaned_output"]
 
 
+class _ClientConn:
+    """Non-blocking, bounded-buffer wrapper around a monitor client socket.
+
+    The realtime audio loop must never block on a debug/monitor consumer: a slow
+    reader (e.g. the testbed GUI) filling the socket buffer would otherwise stall
+    ``sendall``, back up the loop, and overflow the mic/parec input queues -- which
+    drops *input* samples and decimates every stream into sped-up/chipmunk audio.
+
+    Instead each frame is queued and flushed non-blocking. If a client cannot keep
+    up, its oldest *queued* packets are dropped (the in-flight packet always
+    finishes, so the length-prefixed stream stays aligned). The daemon never blocks.
+    """
+
+    def __init__(self, sock: socket.socket, max_pending: int = 200) -> None:
+        sock.setblocking(False)
+        self.sock = sock
+        self.pending: deque[bytes] = deque(maxlen=max_pending)
+        self.head = b""
+        self.head_offset = 0
+        self.dropped = 0
+
+    def push(self, data: bytes) -> None:
+        if len(self.pending) == self.pending.maxlen:
+            self.dropped += 1  # appending to a full deque evicts the oldest packet
+        self.pending.append(data)
+
+    def flush(self) -> bool:
+        """Send as much as the socket will take without blocking. False if dead."""
+        try:
+            while True:
+                if not self.head:
+                    if not self.pending:
+                        return True
+                    self.head = self.pending.popleft()
+                    self.head_offset = 0
+                sent = self.sock.send(self.head[self.head_offset :])
+                if sent <= 0:
+                    return True
+                self.head_offset += sent
+                if self.head_offset >= len(self.head):
+                    self.head = b""
+                    self.head_offset = 0
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+
+    def close(self) -> None:
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
 class SocketPcmOutput:
     def __init__(self, path: str, sample_rate: int, channels: int) -> None:
         self.path = Path(path)
         self.sample_rate = sample_rate
         self.channels = channels
-        self.clients: list[socket.socket] = []
+        self.clients: list[_ClientConn] = []
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
@@ -57,7 +112,7 @@ class SocketPcmOutput:
                 }
                 client.sendall((json.dumps(metadata) + "\n").encode("utf-8"))
                 with self.lock:
-                    self.clients.append(client)
+                    self.clients.append(_ClientConn(client))
             except socket.timeout:
                 continue
             except OSError:
@@ -65,19 +120,15 @@ class SocketPcmOutput:
 
     def write(self, frame) -> None:  # noqa: ANN001
         data = pcm16_bytes(frame)
-        stale: list[socket.socket] = []
         with self.lock:
+            stale: list[_ClientConn] = []
             for client in self.clients:
-                try:
-                    client.sendall(data)
-                except OSError:
+                client.push(data)
+                if not client.flush():
                     stale.append(client)
             for client in stale:
                 self.clients.remove(client)
-                try:
-                    client.close()
-                except OSError:
-                    pass
+                client.close()
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -98,7 +149,7 @@ class MultiStreamSocketOutput:
         self.path = Path(path)
         self.sample_rate = sample_rate
         self.frame_samples = frame_samples
-        self.clients: list[socket.socket] = []
+        self.clients: list[_ClientConn] = []
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
@@ -134,7 +185,7 @@ class MultiStreamSocketOutput:
                 }
                 client.sendall((json.dumps(metadata) + "\n").encode("utf-8"))
                 with self.lock:
-                    self.clients.append(client)
+                    self.clients.append(_ClientConn(client))
             except socket.timeout:
                 continue
             except OSError:
@@ -142,6 +193,9 @@ class MultiStreamSocketOutput:
 
     def write(self, mic, reference, reference_aligned, reference_matched, after_echo, cleaned) -> None:  # noqa: ANN001
         self.frame_index += 1
+        with self.lock:
+            if not self.clients:
+                return  # nothing connected: skip the (non-trivial) JSON/base64 encode
         zero = np.zeros(self.frame_samples, dtype=np.float32)
         packet = {
             "frame_index": self.frame_index,
@@ -158,19 +212,15 @@ class MultiStreamSocketOutput:
         }
         body = json.dumps(packet, separators=(",", ":")).encode("utf-8")
         data = struct.pack("<I", len(body)) + body
-        stale: list[socket.socket] = []
         with self.lock:
+            stale: list[_ClientConn] = []
             for client in self.clients:
-                try:
-                    client.sendall(data)
-                except OSError:
+                client.push(data)
+                if not client.flush():
                     stale.append(client)
             for client in stale:
                 self.clients.remove(client)
-                try:
-                    client.close()
-                except OSError:
-                    pass
+                client.close()
 
     def stop(self) -> None:
         self.stop_event.set()

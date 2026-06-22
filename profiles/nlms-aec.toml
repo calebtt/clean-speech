@@ -18,21 +18,26 @@ enable_highpass = true
 # fixed latency, kept below the acoustic echo delay so the filter stays causal.
 enable_reference_delay_align = true
 reference_delay_mode = "manual"
-reference_delay_ms = 25
-reference_max_delay_ms = 500
+reference_delay_ms = 0
+reference_max_delay_ms = 40
 reference_delay_smoothing = 0.85
+delay_window_ms = 300
+delay_update_min_ref_rms = 0.003
+delay_min_confidence = 0.15
+delay_median_frames = 15
+delay_calibrate_seconds = 10
 reference_sync_latency_frames = 2.5
 # Mic and monitor are on one PipeWire graph (synchronous) -> do NOT resample the
 # reference; resampling warps it and breaks cancellation.
 reference_drift_compensation = false
-mic_delay_ms = 0
+mic_delay_ms = 60
 echo_step_size_warmup = 0.3
 echo_warmup_frames = 150
 enable_reference_level_match = false
 enable_echo_cancellation = true
 echo_canceller = "nlms"
 echo_filter_taps = 4096
-echo_step_size = 0.1
+echo_step_size = 0.3
 echo_filter_leak = 0.0001
 echo_boundary_smoothing_samples = 64
 enable_noise_suppression = false

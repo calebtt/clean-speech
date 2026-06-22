@@ -47,14 +47,20 @@ def best_lag_correlation(a: np.ndarray, b: np.ndarray, step: int = 48, max_lag_m
     return best
 
 
-def nlms_config() -> Config:
+def nlms_config(*, auto_delay: bool = False) -> Config:
     config = Config()
     config.input.sample_rate = SAMPLE_RATE
     config.input.frame_ms = FRAME_MS
     config.processing.enable_highpass = True
     config.processing.enable_reference_delay_align = True
-    config.processing.reference_delay_mode = "manual"
+    config.processing.reference_delay_mode = "auto" if auto_delay else "manual"
     config.processing.reference_delay_ms = 25
+    if auto_delay:
+        config.processing.delay_window_ms = 300
+        config.processing.delay_update_min_ref_rms = 0.002
+        config.processing.delay_min_confidence = 0.08
+        config.processing.delay_median_frames = 10
+        config.processing.reference_delay_smoothing = 0.5
     config.processing.enable_reference_level_match = False
     config.processing.enable_echo_cancellation = True
     config.processing.echo_canceller = "nlms"
@@ -124,6 +130,100 @@ class AecPipelineFixTests(unittest.TestCase):
             mic_best * 0.85,
             f"lagged residual corr {residual_best:.3f} vs mic {mic_best:.3f}",
         )
+
+    def test_recording_cancels_most_of_the_system_audio(self) -> None:
+        """An echo-dominant capture (mostly system audio, near-silent room) must
+        have most of that energy removed by the SHIPPED echo config.
+
+        This guards the shipped ``echo_step_size`` / ``echo_filter_taps`` defaults:
+        a step too low (e.g. 0.05) under-adapts and leaves the echo in. The ceiling
+        is ~6 dB here because this USB webcam mic adds non-linear distortion (onboard
+        AGC) the linear NLMS cannot model -- it already beats the ~4 dB linear-FIR
+        ceiling, so the test targets the achievable, not the ideal.
+        """
+        stamp = "20260622-082629"
+        mic_path = RECORDINGS / f"{stamp}-mic_raw.wav"
+        ref_path = RECORDINGS / f"{stamp}-system_reference.wav"
+        if not mic_path.exists() or not ref_path.exists():
+            self.skipTest("echo-dominant fixture recording not available")
+
+        mic, _ = sf.read(mic_path, dtype="float32")
+        reference, _ = sf.read(ref_path, dtype="float32")
+
+        # Build from shipped defaults so this guards echo_step_size/taps/canceller.
+        config = Config()
+        config.input.sample_rate = SAMPLE_RATE
+        config.input.frame_ms = FRAME_MS
+        # The saved mic_raw is already post-mic-delay; isolate the echo stage.
+        config.processing.mic_delay_ms = 0
+        config.processing.reference_delay_mode = "manual"
+        config.processing.reference_delay_ms = 0
+        config.processing.enable_reference_delay_align = True
+        config.processing.enable_reference_level_match = False
+        config.processing.enable_highpass = False
+        config.processing.enable_noise_suppression = False
+        config.processing.enable_speech_enhancement = False
+        config.processing.enable_vad = False
+
+        pipeline = ProcessingPipeline(config)
+        after_echo_frames = []
+        for mic_frame, ref_frame in zip(frames(mic), frames(reference)):
+            pipeline.process(mic_frame, ref_frame)
+            after_echo_frames.append(pipeline.last_stages["after_echo"])
+        after_echo = np.concatenate(after_echo_frames)
+
+        warmup = FRAME_SAMPLES * 100
+        end = len(after_echo)
+        mic_seg = mic[warmup:end]
+        echo_seg = after_echo[warmup:end]
+        ref_seg = reference[warmup:end]
+
+        def rms(signal: np.ndarray) -> float:
+            return float(np.sqrt(np.mean(signal * signal)) + 1e-12)
+
+        reduction_db = 20.0 * float(np.log10(rms(mic_seg) / rms(echo_seg)))
+        mic_corr = best_lag_correlation(mic_seg, ref_seg)
+        residual_corr = best_lag_correlation(echo_seg, ref_seg)
+
+        # Most of the energy gone (>= ~5 dB == >2/3 of the energy).
+        self.assertGreaterEqual(reduction_db, 5.0, f"only {reduction_db:.1f} dB of system audio removed")
+        # The reference-correlated echo is essentially gone.
+        self.assertLess(residual_corr, 0.12, f"residual echo corr {residual_corr:.3f} still high")
+        self.assertLess(residual_corr, 0.4 * mic_corr, f"residual {residual_corr:.3f} vs mic {mic_corr:.3f}")
+
+    def test_saved_fixture_auto_delay_locks_near_measured_lag(self) -> None:
+        stamp = "20260621-090130"
+        mic_path = RECORDINGS / f"{stamp}-mic_raw.wav"
+        ref_path = RECORDINGS / f"{stamp}-system_reference.wav"
+        if not mic_path.exists() or not ref_path.exists():
+            self.skipTest("saved fixture recordings are not available")
+
+        mic, _ = sf.read(mic_path, dtype="float32")
+        reference, _ = sf.read(ref_path, dtype="float32")
+
+        from clean_speech_daemon.delay_align import median_frame_lag_estimate
+
+        expected_lag, expected_corr, _ = median_frame_lag_estimate(
+            mic,
+            reference,
+            SAMPLE_RATE,
+            FRAME_SAMPLES,
+        )
+        self.assertGreater(expected_corr, 0.35, "fixture should have measurable ref-active echo")
+
+        auto = nlms_config(auto_delay=True)
+        auto_pipe = ProcessingPipeline(auto)
+        delay_track: list[float] = []
+        for mic_frame, ref_frame in zip(frames(mic), frames(reference)):
+            auto_pipe.process(mic_frame, ref_frame)
+            delay_track.append(auto_pipe.stats.reference_delay_ms)
+
+        settled = delay_track[-max(20, len(delay_track) // 4) :]
+        settled_median = float(np.median(settled))
+        expected_ms = expected_lag * 1000.0 / SAMPLE_RATE
+        self.assertAlmostEqual(settled_median, expected_ms, delta=5.0)
+        self.assertGreater(auto_pipe.stats.reference_delay_confidence, 0.05)
+        self.assertNotAlmostEqual(settled_median, 25.0, delta=2.0)
 
 
 if __name__ == "__main__":

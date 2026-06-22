@@ -109,6 +109,17 @@ def echo_config(canceller: str = "scalar") -> Config:
     config.processing.enable_vad = False
     # New knob introduced in step (b). Setting it is harmless if ignored.
     config.processing.echo_canceller = canceller
+    # Synthetic mic/reference are sample-aligned, so disable the shipped default
+    # mic delay (which exists to restore causality on live captures).
+    config.processing.mic_delay_ms = 0
+    config.processing.echo_step_size = 0.3
+    # These exercise the canceller on short synthetic echoes (and artificial clock
+    # drift injected directly, with no sync layer). The shipped 4096-tap filter is
+    # sized for a real room tail and tracks such drift more slowly; pin the short
+    # filter these signals were calibrated for. Real drift is handled upstream by
+    # DriftCompensatingReference, not by the filter length.
+    config.processing.echo_filter_taps = 512
+    config.processing.echo_step_size_warmup = 0.3
     return config
 
 
@@ -237,6 +248,7 @@ class VadCallCountTests(unittest.TestCase):
         config.processing.enable_echo_cancellation = False
         config.processing.enable_noise_suppression = False
         config.processing.enable_speech_enhancement = False
+        config.processing.mic_delay_ms = 0  # feed the raw frame straight to the VAD
 
         pipeline = ProcessingPipeline(config)
 

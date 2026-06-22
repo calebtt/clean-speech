@@ -21,8 +21,34 @@ import soundfile as sf
 
 
 DEFAULT_STREAMS_SOCKET = "/tmp/clean-speech-daemon-streams.sock"
+DEFAULT_CONTROL_SOCKET = "/tmp/clean-speech-daemon-control.sock"
 DEFAULT_STATUS = Path("/tmp/clean-speech-daemon-status.json")
 DEFAULT_RECORD_DIR = Path.home() / "clean-speech-recordings"
+
+ALIGNMENT_INSTRUCTIONS = """\
+Goal: cancel the system audio echo. The adaptive (NLMS) filter can only subtract \
+echo it has already received, so the reference must LEAD the echo in the mic. On \
+many machines the parec monitor reference arrives 15-30 ms LATE, which makes \
+cancellation impossible until you delay the mic to compensate.
+
+Workflow:
+  1. Play steady system audio (music) and connect. Watch "Live Alignment" below.
+  2. Read "mic vs reference": this is the echo. If correlation is near zero there
+     is no echo to cancel (try louder audio / different output).
+  3. Read the lag direction:
+       - "reference LATE" (negative)  -> echo is non-causal. Raise Mic Delay by
+         about the reported amount + 20 ms, then press "Reset Echo Filter".
+       - "reference leads" (positive) -> good; the filter can work.
+  4. Keep Reference Delay mode = manual, delay = 0, and let the filter's taps
+     absorb the residual lead. (Auto mode currently wanders and resets the
+     filter, preventing convergence.)
+  5. After each change press "Reset Echo Filter" and wait ~2 s to re-converge.
+  6. Success = "after_echo vs reference" drops well below "mic vs reference",
+     AND "after_echo / mic level" stays <= 0 dB (no boost = no divergence).
+  7. Listen: set Play stream = "after_echo" to hear the canceller in isolation.
+  8. Press "Save Streams" to write a 12 s capture + alignment report for offline
+     replay (testbed/replay_session.py).
+"""
 STREAM_NAMES = ("mic_raw", "system_reference", "reference_aligned", "reference_matched", "after_echo", "cleaned_output")
 STREAM_LABELS = {
     "mic_raw": "Mic Raw",
@@ -177,8 +203,14 @@ class CleanSpeechTestbed(tk.Tk):
         self.last_packet: MultiStreamPacket | None = None
         self.last_packet_time = 0.0
         self.frames_seen = 0
+        # Draining the socket queue must stay cheap so the reader thread is never
+        # GIL-starved (which would make the daemon drop packets to us and corrupt
+        # saved audio). Redraw the heavy waveforms at a throttled rate instead of
+        # on every drain tick.
+        self._last_draw = 0.0
 
         self.socket_var = tk.StringVar(value=DEFAULT_STREAMS_SOCKET)
+        self.control_socket_var = tk.StringVar(value=DEFAULT_CONTROL_SOCKET)
         self.status_var = tk.StringVar(value="Disconnected")
         self.level_var = tk.DoubleVar(value=0.0)
         self.peak_var = tk.DoubleVar(value=0.0)
@@ -190,11 +222,25 @@ class CleanSpeechTestbed(tk.Tk):
         self.canvas_by_stream: dict[str, tk.Canvas] = {}
         self.level_label_by_stream = {name: tk.StringVar(value="RMS n/a, peak n/a") for name in STREAM_NAMES}
 
+        # Live-tuning controls (pushed to the daemon control socket).
+        self.mic_delay_var = tk.IntVar(value=60)
+        self.ref_delay_var = tk.IntVar(value=0)
+        self.delay_mode_var = tk.StringVar(value="manual")
+        self.control_status_var = tk.StringVar(value="Control: idle")
+        # Live alignment readout, computed from the in-memory buffers.
+        self.align_echo_var = tk.StringVar(value="mic vs reference: waiting for audio")
+        self.align_lag_var = tk.StringVar(value="lag: --")
+        self.align_residual_var = tk.StringVar(value="after_echo vs reference: --")
+        self.align_diverge_var = tk.StringVar(value="after_echo / mic level: --")
+        self.align_verdict_var = tk.StringVar(value="Verdict: waiting...")
+        self.align_verdict_label: ttk.Label | None = None
+
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(40, self._pump_audio)
         self.after(250, self._pump_status)
         self.after(1000, self._pump_diagnostics)
+        self.after(750, self._update_alignment)
         self.after(200, self.connect)
 
     def _build_ui(self) -> None:
@@ -204,10 +250,19 @@ class CleanSpeechTestbed(tk.Tk):
         connection = ttk.LabelFrame(outer, text="Daemon Multi-Stream Connection", padding=10)
         connection.pack(fill=tk.X)
 
-        ttk.Label(connection, text="Socket").pack(side=tk.LEFT)
-        ttk.Entry(connection, textvariable=self.socket_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
-        ttk.Button(connection, text="Connect", command=self.connect).pack(side=tk.LEFT, padx=4)
-        ttk.Button(connection, text="Disconnect", command=self.disconnect).pack(side=tk.LEFT)
+        row1 = ttk.Frame(connection)
+        row1.pack(fill=tk.X)
+        ttk.Label(row1, text="Stream socket", width=14).pack(side=tk.LEFT)
+        ttk.Entry(row1, textvariable=self.socket_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        ttk.Button(row1, text="Connect", command=self.connect).pack(side=tk.LEFT, padx=4)
+        ttk.Button(row1, text="Disconnect", command=self.disconnect).pack(side=tk.LEFT)
+        row2 = ttk.Frame(connection)
+        row2.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(row2, text="Control socket", width=14).pack(side=tk.LEFT)
+        ttk.Entry(row2, textvariable=self.control_socket_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+        ttk.Button(row2, text="Workflow / Help", command=self.show_instructions).pack(side=tk.LEFT)
+
+        self._build_alignment_panel(outer)
 
         meters = ttk.LabelFrame(outer, text="Stream Overview", padding=10)
         meters.pack(fill=tk.X, pady=12)
@@ -246,6 +301,155 @@ class CleanSpeechTestbed(tk.Tk):
         diagnostics = ttk.LabelFrame(outer, text="Daemon Diagnostics", padding=10)
         diagnostics.pack(fill=tk.X, pady=(12, 0))
         ttk.Label(diagnostics, textvariable=self.diagnostics_var, justify=tk.LEFT).pack(anchor=tk.W)
+
+    def _build_alignment_panel(self, outer: ttk.Frame) -> None:
+        align = ttk.LabelFrame(outer, text="Echo Alignment (live tuning via control socket)", padding=10)
+        align.pack(fill=tk.X, pady=12)
+
+        hint = (
+            "Reference must LEAD the echo for cancellation. If the readout says "
+            "\"reference LATE\", raise Mic Delay by that amount + ~20 ms and Reset. "
+            "Click Workflow / Help for the full procedure."
+        )
+        ttk.Label(align, text=hint, wraplength=900, justify=tk.LEFT, foreground="#9aa4b2").pack(anchor=tk.W, pady=(0, 8))
+
+        controls = ttk.Frame(align)
+        controls.pack(fill=tk.X)
+        ttk.Label(controls, text="Mic delay (ms)").pack(side=tk.LEFT)
+        ttk.Spinbox(controls, from_=0, to=200, increment=5, width=5, textvariable=self.mic_delay_var).pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Button(controls, text="-5", width=3, command=lambda: self._nudge_mic_delay(-5)).pack(side=tk.LEFT)
+        ttk.Button(controls, text="+5", width=3, command=lambda: self._nudge_mic_delay(5)).pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Button(controls, text="Apply", command=self._apply_mic_delay).pack(side=tk.LEFT, padx=(0, 14))
+
+        ttk.Label(controls, text="Ref delay (ms)").pack(side=tk.LEFT)
+        ttk.Spinbox(controls, from_=0, to=200, increment=1, width=5, textvariable=self.ref_delay_var).pack(side=tk.LEFT, padx=(4, 2))
+        ttk.Label(controls, text="mode").pack(side=tk.LEFT, padx=(6, 2))
+        ttk.Combobox(controls, textvariable=self.delay_mode_var, values=("manual", "auto"), state="readonly", width=7).pack(side=tk.LEFT)
+        ttk.Button(controls, text="Apply", command=self._apply_ref_delay).pack(side=tk.LEFT, padx=(2, 14))
+
+        ttk.Button(controls, text="Reset Echo Filter", command=self._reset_echo_filter).pack(side=tk.LEFT)
+
+        readout = ttk.Frame(align)
+        readout.pack(fill=tk.X, pady=(10, 0))
+        ttk.Label(readout, textvariable=self.align_echo_var).grid(row=0, column=0, sticky=tk.W, padx=(0, 20))
+        ttk.Label(readout, textvariable=self.align_lag_var).grid(row=0, column=1, sticky=tk.W)
+        ttk.Label(readout, textvariable=self.align_residual_var).grid(row=1, column=0, sticky=tk.W, padx=(0, 20))
+        ttk.Label(readout, textvariable=self.align_diverge_var).grid(row=1, column=1, sticky=tk.W)
+        self.align_verdict_label = ttk.Label(readout, textvariable=self.align_verdict_var, font=("TkDefaultFont", 10, "bold"))
+        self.align_verdict_label.grid(row=2, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
+        ttk.Label(align, textvariable=self.control_status_var, foreground="#9aa4b2").pack(anchor=tk.W, pady=(8, 0))
+
+    def show_instructions(self) -> None:
+        top = tk.Toplevel(self)
+        top.title("Echo Alignment Workflow")
+        top.geometry("680x560")
+        text = tk.Text(top, wrap=tk.WORD, padx=12, pady=12, font=("TkDefaultFont", 10))
+        text.insert("1.0", ALIGNMENT_INSTRUCTIONS)
+        text.configure(state=tk.DISABLED)
+        text.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(top, text="Close", command=top.destroy).pack(pady=8)
+
+    def _send_control(self, payload: dict[str, object]) -> None:
+        try:
+            response = send_control_command(self.control_socket_var.get(), payload)
+        except FileNotFoundError:
+            self.control_status_var.set(f"Control: socket not found ({self.control_socket_var.get()}) — is the daemon running?")
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.control_status_var.set(f"Control: error — {exc}")
+            return
+        sent = ", ".join(f"{k}={v}" for k, v in payload.items())
+        ok = response.get("ok")
+        self.control_status_var.set(f"Control: {'sent' if ok else 'rejected'} ({sent}) -> {response}")
+
+    def _apply_mic_delay(self) -> None:
+        self._send_control({"mic_delay_ms": float(self.mic_delay_var.get())})
+
+    def _nudge_mic_delay(self, delta: int) -> None:
+        self.mic_delay_var.set(max(0, self.mic_delay_var.get() + delta))
+        self._apply_mic_delay()
+
+    def _apply_ref_delay(self) -> None:
+        self._send_control(
+            {"reference_delay_mode": self.delay_mode_var.get(), "reference_delay_ms": float(self.ref_delay_var.get())}
+        )
+
+    def _reset_echo_filter(self) -> None:
+        self._send_control({"reset_echo_filter": True})
+
+    def _update_alignment(self) -> None:
+        try:
+            self._refresh_alignment_metrics()
+        finally:
+            self.after(1000, self._update_alignment)
+
+    def _refresh_alignment_metrics(self) -> None:
+        sample_rate = 48_000
+        window = sample_rate * 5  # judge on the last ~5 s
+        mic = self._recent_samples("mic_raw", window)
+        ref = self._recent_samples("system_reference", window)
+        echo = self._recent_samples("after_echo", window)
+        if mic is None or ref is None or len(mic) < sample_rate or len(ref) < sample_rate:
+            self.align_verdict_var.set("Verdict: waiting for buffered audio...")
+            self._set_verdict_color("#9aa4b2")
+            return
+
+        lag, mic_corr = best_lag_samples(mic, ref, sample_rate)
+        self.align_echo_var.set(f"mic vs reference: {abs(mic_corr):.3f}  (echo strength)")
+        lag_ms = lag * 1000.0 / sample_rate
+        if lag >= 0:
+            self.align_lag_var.set(f"lag: reference leads by {lag_ms:.0f} ms (causal)")
+        else:
+            self.align_lag_var.set(f"lag: reference LATE by {-lag_ms:.0f} ms (non-causal)")
+
+        residual_corr = None
+        rms_ratio = None
+        if echo is not None and len(echo) >= sample_rate:
+            _, residual_corr = best_lag_samples(echo, ref, sample_rate)
+            mic_rms = float(np.sqrt(np.mean(mic * mic)) + 1e-12)
+            echo_rms = float(np.sqrt(np.mean(echo * echo)) + 1e-12)
+            rms_ratio = echo_rms / mic_rms
+            self.align_residual_var.set(f"after_echo vs reference: {abs(residual_corr):.3f}  (lower = more removed)")
+            self.align_diverge_var.set(f"after_echo / mic level: {db(rms_ratio):+.1f} dB  (want <= 0)")
+        else:
+            self.align_residual_var.set("after_echo vs reference: --")
+            self.align_diverge_var.set("after_echo / mic level: --")
+
+        self._set_verdict(abs(mic_corr), lag, None if residual_corr is None else abs(residual_corr), rms_ratio)
+
+    def _set_verdict(self, mic_corr: float, lag: int, residual_corr: float | None, rms_ratio: float | None) -> None:
+        if mic_corr < 0.05:
+            self.align_verdict_var.set("Verdict: no measurable echo — play louder system audio to align.")
+            self._set_verdict_color("#9aa4b2")
+            return
+        if lag < 0:
+            need = int(-lag * 1000.0 / 48_000.0) + 20
+            self.align_verdict_var.set(
+                f"Verdict: reference is LATE — non-causal. Raise Mic Delay to ~{self.mic_delay_var.get() + need} ms and Reset."
+            )
+            self._set_verdict_color("#fb7185")
+            return
+        if rms_ratio is not None and rms_ratio > 1.05:
+            self.align_verdict_var.set("Verdict: filter is DIVERGING (boosting level). Reset Echo Filter; check delay.")
+            self._set_verdict_color("#fb7185")
+            return
+        if residual_corr is not None and residual_corr < 0.6 * mic_corr:
+            self.align_verdict_var.set("Verdict: GOOD — echo is being cancelled (residual well below mic). Listen to after_echo.")
+            self._set_verdict_color("#86efac")
+            return
+        self.align_verdict_var.set("Verdict: causal but little cancellation yet — press Reset Echo Filter and wait ~2 s.")
+        self._set_verdict_color("#fbbf24")
+
+    def _set_verdict_color(self, color: str) -> None:
+        if self.align_verdict_label is not None:
+            self.align_verdict_label.configure(foreground=color)
+
+    def _recent_samples(self, name: str, count: int) -> np.ndarray | None:
+        frames = list(self.buffers[name])
+        if not frames:
+            return None
+        audio = np.concatenate(frames)
+        return audio[-count:] if len(audio) > count else audio
 
     def connect(self) -> None:
         self.disconnect()
@@ -336,7 +540,11 @@ class CleanSpeechTestbed(tk.Tk):
                 self.level_label_by_stream[name].set(
                     f"RMS {db(metrics['rms']):.1f} dBFS, peak {db(max(metrics['peak'], 1e-12)):.1f} dBFS"
                 )
-                self._draw_waveform(name)
+            now = time.monotonic()
+            if now - self._last_draw >= 0.15:
+                self._last_draw = now
+                for name in STREAM_NAMES:
+                    self._draw_waveform(name)
         elif self.last_packet_time and time.monotonic() - self.last_packet_time > 1.5:
             self.level_var.set(0.0)
             self.peak_var.set(0.0)
@@ -444,6 +652,52 @@ class CleanSpeechTestbed(tk.Tk):
     def _on_close(self) -> None:
         self.disconnect()
         self.destroy()
+
+
+def send_control_command(socket_path: str, payload: dict[str, object], timeout: float = 1.0) -> dict[str, object]:
+    """Send one JSON-line tuning command to the daemon control socket and read the reply."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(timeout)
+        client.connect(socket_path)
+        client.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        data = b""
+        while b"\n" not in data:
+            chunk = client.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+    line = data.split(b"\n", 1)[0].strip()
+    if not line:
+        return {"ok": False, "error": "no response"}
+    result = json.loads(line.decode("utf-8"))
+    return result if isinstance(result, dict) else {"ok": False, "error": "invalid response"}
+
+
+def best_lag_samples(a: np.ndarray, b: np.ndarray, sample_rate: int, max_lag_ms: int = 120) -> tuple[int, float]:
+    """Best integer lag (samples) and normalized correlation between a and b via FFT.
+
+    Positive lag means ``a`` lags ``b`` (b is earlier). With a=mic_raw, b=reference,
+    a positive lag means the reference leads the echo (causal, good); negative means
+    the reference arrives after the echo (non-causal, needs more mic delay).
+    """
+    n = min(len(a), len(b))
+    if n < 256:
+        return 0, 0.0
+    a = np.asarray(a[-n:], dtype=np.float64)
+    b = np.asarray(b[-n:], dtype=np.float64)
+    a -= a.mean()
+    b -= b.mean()
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na < 1e-9 or nb < 1e-9:
+        return 0, 0.0
+    nfft = 1 << int(np.ceil(np.log2(2 * n)))
+    xcorr = np.fft.irfft(np.fft.rfft(a, nfft) * np.conj(np.fft.rfft(b, nfft)), nfft)
+    max_lag = min(n - 1, int(sample_rate * max_lag_ms / 1000))
+    corr = np.concatenate([xcorr[-max_lag:], xcorr[: max_lag + 1]])
+    lags = np.arange(-max_lag, max_lag + 1)
+    index = int(np.argmax(np.abs(corr)))
+    return int(lags[index]), float(corr[index] / (na * nb))
 
 
 def recv_exact(client: socket.socket, length: int) -> bytes:

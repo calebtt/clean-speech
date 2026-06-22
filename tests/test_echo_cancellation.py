@@ -66,6 +66,13 @@ def base_echo_config() -> Config:
     config.processing.enable_noise_suppression = False
     config.processing.enable_speech_enhancement = False
     config.processing.enable_vad = False
+    # Synthetic mic/reference are sample-aligned here, so cancel the shipped
+    # default mic delay (which exists to restore causality on live captures).
+    config.processing.mic_delay_ms = 0
+    # Strong step to exercise full convergence on clean synthetic echo (matches the
+    # shipped default; pinned so these tests are independent of default changes).
+    config.processing.echo_step_size = 0.3
+    config.processing.echo_step_size_warmup = 0.3
     return config
 
 

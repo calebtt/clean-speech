@@ -32,7 +32,9 @@ class RuntimeConfigRegressionTests(unittest.TestCase):
         self.assertEqual(config.processing.echo_canceller, "nlms")
         self.assertTrue(config.processing.enable_reference_delay_align)
         self.assertFalse(config.processing.enable_reference_level_match)
-        self.assertEqual(config.processing.mic_delay_ms, 0)
+        # 60 ms is the shipped default: it restores AEC causality (the parec monitor
+        # reference arrives after the echo on live captures).
+        self.assertEqual(config.processing.mic_delay_ms, 60)
         self.assertGreaterEqual(config.processing.echo_filter_taps, 512)
 
     def test_old_config_without_echo_canceller_still_uses_nlms(self) -> None:
@@ -71,6 +73,7 @@ enable_echo_cancellation = true
         config.processing.enable_noise_suppression = False
         config.processing.enable_speech_enhancement = False
         config.processing.enable_vad = True
+        config.processing.mic_delay_ms = 0  # after_echo must equal the input frame
         config.vad.pre_roll_ms = 300
         frame = np.full(960, 0.05, dtype=np.float32)
 

@@ -105,6 +105,10 @@ class DriftCompensatingReference:
     def latency_frames(self) -> float:
         return self.available() / self.frame_samples
 
+    def set_target_latency_frames(self, target_latency_frames: float) -> None:
+        self.target_latency = float(target_latency_frames) * self.frame_samples
+        self.avg_backlog = self.target_latency
+
     # -- consumer side ---------------------------------------------------- #
     def pull(self) -> np.ndarray | None:
         """Return one mic-clock-aligned reference frame, or None on underrun."""

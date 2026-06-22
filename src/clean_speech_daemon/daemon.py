@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+from queue import Empty, Queue
 import signal
 import time
 
+from .control import ControlServer
 from .diagnostics import DiagnosticsLogger, StageWavWriter, audio_metrics, correlation
 from .audio import InputStreamReader, PulseMonitorReader
 from .config import Config
@@ -53,6 +55,8 @@ class CleanSpeechDaemon:
             target_latency_frames=float(config.processing.reference_sync_latency_frames),
             drift_compensation=bool(config.processing.reference_drift_compensation),
         )
+        self._control_queue: Queue[dict[str, object]] = Queue()
+        self._control_server = ControlServer(config.output.control_socket_path, self._control_queue)
 
     def request_stop(self, *_args) -> None:  # noqa: ANN002
         self.stop_requested = True
@@ -73,11 +77,14 @@ class CleanSpeechDaemon:
         print(f"socket output: {self.config.output.socket_path}", flush=True)
         print(f"multi-stream socket output: {self.config.output.streams_socket_path}", flush=True)
         print(f"fifo output: {self.config.output.fifo_path}", flush=True)
+        print(f"control socket: {self.config.output.control_socket_path}", flush=True)
         print("starting microphone processing", flush=True)
 
+        self._control_server.start()
         try:
             self._run_audio_loop()
         finally:
+            self._control_server.stop()
             self.pulse_source.stop()
             self.socket_output.stop()
             self.streams_output.stop()
@@ -123,6 +130,7 @@ class CleanSpeechDaemon:
                     )
 
             while not self.stop_requested:
+                self._poll_control_commands()
                 mic_frame = mic.read(timeout=0.5)
                 ref_data = None
                 if reference is not None:
@@ -166,6 +174,29 @@ class CleanSpeechDaemon:
                     )
                     last_stats = now
 
+    def _poll_control_commands(self) -> None:
+        while True:
+            try:
+                command = self._control_queue.get_nowait()
+            except Empty:
+                break
+            self._apply_control_command(command)
+
+    def _apply_control_command(self, command: dict[str, object]) -> None:
+        tuning = self.pipeline.apply_tuning(
+            reference_delay_ms=_as_optional_float(command.get("reference_delay_ms")),
+            reference_delay_mode=_as_optional_str(command.get("reference_delay_mode")),
+            mic_delay_ms=_as_optional_float(command.get("mic_delay_ms")),
+        )
+        sync_frames = _as_optional_float(command.get("reference_sync_latency_frames"))
+        if sync_frames is not None:
+            self.ref_sync.set_target_latency_frames(sync_frames)
+            self.config.processing.reference_sync_latency_frames = sync_frames
+            tuning["reference_sync_latency_frames"] = sync_frames
+        if bool(command.get("reset_echo_filter")):
+            self.pipeline.reset_echo_filter()
+            tuning["reset_echo_filter"] = True
+
     def _write_diagnostics(self, stages, reference, cleaned) -> None:  # noqa: ANN001
         stats = self.pipeline.stats
         mic = stages.get("hardware_mic")
@@ -186,6 +217,14 @@ class CleanSpeechDaemon:
                     "reference_delay_ms": self.config.processing.reference_delay_ms,
                     "reference_max_delay_ms": self.config.processing.reference_max_delay_ms,
                     "reference_delay_smoothing": self.config.processing.reference_delay_smoothing,
+                    "delay_window_ms": self.config.processing.delay_window_ms,
+                    "delay_update_min_ref_rms": self.config.processing.delay_update_min_ref_rms,
+                    "delay_min_confidence": self.config.processing.delay_min_confidence,
+                    "delay_median_frames": self.config.processing.delay_median_frames,
+                    "delay_calibrate_seconds": self.config.processing.delay_calibrate_seconds,
+                    "delay_cancellation_aware": self.config.processing.delay_cancellation_aware,
+                    "delay_fine_tune_ms": self.config.processing.delay_fine_tune_ms,
+                    "delay_target_residual_corr": self.config.processing.delay_target_residual_corr,
                     "enable_reference_level_match": self.config.processing.enable_reference_level_match,
                     "enable_echo_cancellation": self.config.processing.enable_echo_cancellation,
                     "echo_canceller": self.config.processing.echo_canceller,
@@ -224,6 +263,8 @@ class CleanSpeechDaemon:
                     "reference_gain": stats.reference_gain,
                     "reference_delay_ms": stats.reference_delay_ms,
                     "reference_delay_correlation": stats.reference_delay_correlation,
+                    "reference_delay_confidence": stats.reference_delay_confidence,
+                    "reference_cancellation_score": stats.reference_cancellation_score,
                     "residual_ref_correlation": stats.residual_ref_correlation,
                     "ref_present": stats.ref_present,
                     "clipped_output_pct": stats.clipped_output_pct,
@@ -255,3 +296,15 @@ class CleanSpeechDaemon:
             "last_error": reader.last_error,
             "sync": sync,
         }
+
+
+def _as_optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    return float(value)
+
+
+def _as_optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    return str(value)
