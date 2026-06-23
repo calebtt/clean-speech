@@ -201,6 +201,13 @@ class CleanSpeechDaemon:
                 tuning["echo_canceller"] = echo_canceller
             if mask_smooth is not None:
                 tuning["dtln_mask_smoothing"] = mask_smooth
+        lv_blend = _as_optional_float(command.get("localvqe_blend"))
+        if lv_blend is not None:
+            lv_blend = max(0.0, min(1.0, lv_blend))
+            self.config.processing.localvqe_blend = lv_blend
+            if hasattr(self.pipeline.echo, "localvqe_blend"):  # live-tunable on the canceller
+                self.pipeline.echo.localvqe_blend = lv_blend
+            tuning["localvqe_blend"] = lv_blend
         if bool(command.get("reset_echo_filter")):
             self.pipeline.reset_echo_filter()
             tuning["reset_echo_filter"] = True
@@ -238,6 +245,7 @@ class CleanSpeechDaemon:
                     "echo_canceller": self.config.processing.echo_canceller,
                     "echo_swap_status": getattr(self.pipeline, "echo_swap_status", ""),
                     "dtln_mask_smoothing": getattr(self.config.processing, "dtln_mask_smoothing", None),
+                    "localvqe_blend": getattr(self.config.processing, "localvqe_blend", None),
                     "echo_filter_taps": self.config.processing.echo_filter_taps,
                     "echo_step_size": self.config.processing.echo_step_size,
                     "echo_filter_leak": self.config.processing.echo_filter_leak,

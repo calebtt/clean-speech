@@ -104,6 +104,26 @@ class NeuralAecTests(unittest.TestCase):
         self.assertLess(residual, 0.15, f"residual echo corr {residual:.3f}")
         self.assertLess(residual, 0.4 * mic_corr, f"residual {residual:.3f} vs mic {mic_corr:.3f}")
 
+    def test_hybrid_localvqe_blend_builds_and_cancels(self):
+        from clean_speech_daemon.neural_aec import NeuralEchoCanceller
+        try:
+            from clean_speech_daemon.neural_aec import StreamingLocalVQE
+            StreamingLocalVQE()  # probe: needs lib/liblocalvqe.so + GGUF model
+        except Exception as exc:  # noqa: BLE001
+            self.skipTest(f"LocalVQE engine/model not available: {exc}")
+
+        mic, ref = self._load_fixture()
+        aec = NeuralEchoCanceller("hybrid_localvqe", FRAME, SR, mask_smooth=0.6, localvqe_blend=0.7)
+        out = np.zeros(len(mic), np.float32)
+        for i in range(0, len(mic) - FRAME, FRAME):
+            out[i:i + FRAME] = aec.process(mic[i:i + FRAME], ref[i:i + FRAME])
+        w = int(2.5 * SR)
+        def rms(x):
+            return float(np.sqrt(np.mean(x * x)) + 1e-12)
+        reduction = 20.0 * np.log10(rms(mic[w:]) / rms(out[w:]))
+        self.assertGreaterEqual(reduction, 12.0, f"hybrid_localvqe removed only {reduction:.1f} dB")
+        self.assertLess(_best_lag_corr(out[w:], ref[w:]), 0.15)
+
 
 if __name__ == "__main__":
     unittest.main()

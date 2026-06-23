@@ -208,17 +208,104 @@ class StreamingNkf:
 
 
 # --------------------------------------------------------------------------- #
+# Streaming LocalVQE (reference-aware AEC+NS+dereverb) via the GGML C engine
+# --------------------------------------------------------------------------- #
+LIBDIR = Path(__file__).resolve().parents[2] / "lib"
+LOCALVQE_GGUF = "localvqe-v1.3-4.8M-f32.gguf"
+_LV_LIB = None
+
+
+def _localvqe_lib():
+    """Load liblocalvqe.so (and its ggml deps) once; return the configured handle.
+
+    The PyTorch LocalVQE model is not chunk-streamable, but the GGML engine's
+    localvqe_process_frame_f32() is bit-identical batch-vs-frame, so it drives the
+    realtime loop. The CPU backend variants are discovered by ggml in its own
+    directory (GGML_BACKEND_PATH), so the vendored lib/ is self-contained.
+    """
+    global _LV_LIB
+    if _LV_LIB is not None:
+        return _LV_LIB
+    import ctypes
+    import os
+
+    os.environ.setdefault("GGML_BACKEND_PATH", str(LIBDIR))
+    for dep in ("libggml-base.so", "libggml.so"):
+        ctypes.CDLL(str(LIBDIR / dep), mode=ctypes.RTLD_GLOBAL)
+    lib = ctypes.CDLL(str(LIBDIR / "liblocalvqe.so"))
+    cfloat_p = ctypes.POINTER(ctypes.c_float)
+    lib.localvqe_new.restype = ctypes.c_void_p
+    lib.localvqe_new.argtypes = [ctypes.c_char_p]
+    for fn in ("localvqe_process_f32", "localvqe_process_frame_f32"):
+        f = getattr(lib, fn)
+        f.restype = ctypes.c_int
+        f.argtypes = [ctypes.c_void_p, cfloat_p, cfloat_p, ctypes.c_int, cfloat_p]
+    for fn in ("localvqe_hop_length", "localvqe_sample_rate"):
+        f = getattr(lib, fn)
+        f.restype = ctypes.c_int
+        f.argtypes = [ctypes.c_void_p]
+    lib.localvqe_reset.argtypes = [ctypes.c_void_p]
+    lib.localvqe_free.argtypes = [ctypes.c_void_p]
+    _LV_LIB = (lib, cfloat_p)
+    return _LV_LIB
+
+
+class StreamingLocalVQE:
+    def __init__(self, gguf: str = LOCALVQE_GGUF) -> None:
+        self._lib, self._cfp = _localvqe_lib()
+        self._ctx = self._lib.localvqe_new(str(LIBDIR.parent / "models" / gguf).encode())
+        if not self._ctx:
+            raise RuntimeError(f"LocalVQE failed to load model {gguf}")
+        self.hop = self._lib.localvqe_hop_length(self._ctx)
+        self._qi = np.zeros(0, np.float32)
+        self._qr = np.zeros(0, np.float32)
+
+    def _cf(self, a: np.ndarray):
+        return np.ascontiguousarray(a, np.float32).ctypes.data_as(self._cfp)
+
+    def process(self, mic: np.ndarray, ref: np.ndarray) -> np.ndarray:
+        self._qi = np.concatenate([self._qi, np.asarray(mic, np.float32)])
+        self._qr = np.concatenate([self._qr, np.asarray(ref, np.float32)])
+        out = []
+        while len(self._qi) >= self.hop and len(self._qr) >= self.hop:
+            mc = self._qi[: self.hop].copy(); self._qi = self._qi[self.hop :]
+            rc = self._qr[: self.hop].copy(); self._qr = self._qr[self.hop :]
+            o = np.zeros(self.hop, np.float32)
+            self._lib.localvqe_process_frame_f32(self._ctx, self._cf(mc), self._cf(rc), self.hop, self._cf(o))
+            out.append(o)
+        return np.concatenate(out) if out else np.zeros(0, np.float32)
+
+    def reset(self) -> None:
+        self._lib.localvqe_reset(self._ctx)
+        self._qi = np.zeros(0, np.float32)
+        self._qr = np.zeros(0, np.float32)
+
+    def __del__(self) -> None:
+        try:
+            if getattr(self, "_ctx", 0):
+                self._lib.localvqe_free(self._ctx)
+        except Exception:
+            pass
+
+
+# Streaming hybrid leads LocalVQE by ~128 samples @16 kHz; delay LocalVQE to align
+# the two before blending (measured by cross-correlation, low but consistent).
+LOCALVQE_BLEND_ALIGN = 128
+
+
+# --------------------------------------------------------------------------- #
 # Daemon-facing 48 kHz canceller
 # --------------------------------------------------------------------------- #
 class NeuralEchoCanceller:
     def __init__(self, method: str, frame_samples: int, sample_rate: int = 48_000,
-                 mask_smooth: float = 0.6) -> None:
-        if method not in ("dtln", "nkf", "hybrid"):
+                 mask_smooth: float = 0.6, localvqe_blend: float = 0.7) -> None:
+        if method not in ("dtln", "nkf", "hybrid", "hybrid_localvqe"):
             raise ValueError(f"unknown neural method {method!r}")
         self.method = method
         self.frame_samples = int(frame_samples)
         self.sample_rate = int(sample_rate)
         self.mask_smooth = float(mask_smooth)
+        self.localvqe_blend = float(np.clip(localvqe_blend, 0.0, 1.0))
         self.gain = 0.0  # diagnostics: recent suppression (1 - out/mic)
         self._build()
 
@@ -227,8 +314,15 @@ class NeuralEchoCanceller:
         self._rs_mic = soxr.ResampleStream(sr, 16_000, 1, dtype="float32", quality="HQ")
         self._rs_ref = soxr.ResampleStream(sr, 16_000, 1, dtype="float32", quality="HQ")
         self._rs_out = soxr.ResampleStream(16_000, sr, 1, dtype="float32", quality="HQ")
-        self._nkf = StreamingNkf() if self.method in ("nkf", "hybrid") else None
-        self._dtln = StreamingDtln(self.mask_smooth) if self.method in ("dtln", "hybrid") else None
+        hybrid = self.method in ("hybrid", "hybrid_localvqe")
+        self._nkf = StreamingNkf() if self.method == "nkf" or hybrid else None
+        self._dtln = StreamingDtln(self.mask_smooth) if self.method == "dtln" or hybrid else None
+        # hybrid_localvqe: run LocalVQE alongside the hybrid and blend (LocalVQE
+        # scrubs the residual; the hybrid keeps the near-end voice prominent).
+        self._localvqe = StreamingLocalVQE() if self.method == "hybrid_localvqe" else None
+        self._hyb_fifo = np.zeros(0, np.float32)
+        # delay LocalVQE so its output time-aligns with the hybrid before blending
+        self._lv_fifo = np.zeros(LOCALVQE_BLEND_ALIGN, np.float32) if self.method == "hybrid_localvqe" else np.zeros(0, np.float32)
         self._ref16 = np.zeros(0, np.float32)   # ref delay-line aligned to NKF residual
         self._out48 = np.zeros(0, np.float32)    # output FIFO @ daemon rate
         self._primed = False
@@ -250,12 +344,25 @@ class NeuralEchoCanceller:
             clean16 = self._dtln.process(mic16, ref16)
         elif self.method == "nkf":
             clean16 = self._nkf.process(mic16, ref16)
-        else:  # hybrid: NKF residual -> DTLN, with reference delay-aligned to the residual
+        else:  # hybrid / hybrid_localvqe: NKF residual -> DTLN, ref delay-aligned to it
             self._ref16 = np.concatenate([self._ref16, ref16])
             residual = self._nkf.process(mic16, ref16)
             m = len(residual)
             ref_aligned, self._ref16 = self._ref16[:m], self._ref16[m:]
-            clean16 = self._dtln.process(residual, ref_aligned) if m else np.zeros(0, np.float32)
+            hyb16 = self._dtln.process(residual, ref_aligned) if m else np.zeros(0, np.float32)
+            if self.method == "hybrid":
+                clean16 = hyb16
+            else:  # blend hybrid (keeps voice) with LocalVQE (scrubs residual)
+                lv16 = self._localvqe.process(mic16, ref16)
+                self._hyb_fifo = np.concatenate([self._hyb_fifo, hyb16])
+                self._lv_fifo = np.concatenate([self._lv_fifo, lv16])
+                k = min(len(self._hyb_fifo), len(self._lv_fifo))
+                if k:
+                    b = self.localvqe_blend
+                    clean16 = (b * self._lv_fifo[:k] + (1.0 - b) * self._hyb_fifo[:k]).astype(np.float32)
+                    self._hyb_fifo, self._lv_fifo = self._hyb_fifo[k:], self._lv_fifo[k:]
+                else:
+                    clean16 = np.zeros(0, np.float32)
 
         if len(clean16):
             # Final NaN/Inf defense before the audio leaves the canceller.

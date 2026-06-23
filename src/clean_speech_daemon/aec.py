@@ -174,7 +174,7 @@ def make_echo_canceller(config, frame_samples: int):  # noqa: ANN001
             step_size_warmup=float(getattr(config.processing, "echo_step_size_warmup", 0.3)),
             warmup_frames=int(getattr(config.processing, "echo_warmup_frames", 150)),
         )
-    if kind in ("dtln", "nkf", "hybrid"):
+    if kind in ("dtln", "nkf", "hybrid", "hybrid_localvqe"):
         # Neural cancellers (16 kHz models wrapped for the 48 kHz realtime loop).
         from .neural_aec import NeuralEchoCanceller
 
@@ -183,5 +183,6 @@ def make_echo_canceller(config, frame_samples: int):  # noqa: ANN001
             frame_samples,
             sample_rate=int(config.input.sample_rate),
             mask_smooth=float(getattr(config.processing, "dtln_mask_smoothing", 0.6)),
+            localvqe_blend=float(getattr(config.processing, "localvqe_blend", 0.7)),
         )
     return AdaptiveEchoReducer()

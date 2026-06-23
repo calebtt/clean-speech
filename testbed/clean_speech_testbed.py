@@ -238,6 +238,7 @@ class CleanSpeechTestbed(tk.Tk):
         # Live AEC model switcher + effectiveness readout.
         self.model_var = tk.StringVar(value="hybrid")
         self.mask_smooth_var = tk.DoubleVar(value=0.6)
+        self.localvqe_blend_var = tk.DoubleVar(value=0.7)
         self.aec_active_var = tk.StringVar(value="active model: (waiting for daemon)")
         self.aec_reduction_var = tk.StringVar(value="echo removed (mic → after_echo): -- dB")
         self.aec_reduction_label: ttk.Label | None = None
@@ -317,18 +318,28 @@ class CleanSpeechTestbed(tk.Tk):
         row = ttk.Frame(panel)
         row.pack(fill=tk.X)
         ttk.Label(row, text="Canceller").pack(side=tk.LEFT)
-        ttk.Combobox(row, textvariable=self.model_var, state="readonly", width=9,
-                     values=("hybrid", "dtln", "nkf", "nlms", "scalar")).pack(side=tk.LEFT, padx=(4, 14))
+        ttk.Combobox(row, textvariable=self.model_var, state="readonly", width=15,
+                     values=("hybrid_localvqe", "hybrid", "dtln", "nkf", "nlms", "scalar")).pack(side=tk.LEFT, padx=(4, 14))
         ttk.Label(row, text="DTLN mask smoothing").pack(side=tk.LEFT)
         ttk.Spinbox(row, from_=0.0, to=0.95, increment=0.05, width=5,
                     textvariable=self.mask_smooth_var, format="%.2f").pack(side=tk.LEFT, padx=(4, 14))
         ttk.Button(row, text="Apply Model", command=self._apply_model).pack(side=tk.LEFT)
         ttk.Label(row, textvariable=self.aec_active_var, foreground="#9aa4b2").pack(side=tk.RIGHT)
 
+        row2 = ttk.Frame(panel)
+        row2.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(row2, text="LocalVQE blend (hybrid_localvqe)").pack(side=tk.LEFT)
+        ttk.Spinbox(row2, from_=0.0, to=1.0, increment=0.05, width=5,
+                    textvariable=self.localvqe_blend_var, format="%.2f").pack(side=tk.LEFT, padx=(4, 6))
+        ttk.Button(row2, text="Set Blend (live)", command=self._set_blend).pack(side=tk.LEFT)
+        ttk.Label(row2, text="0 = hybrid only · 1 = LocalVQE only (scrubs residual, may dull voice)",
+                  foreground="#9aa4b2").pack(side=tk.LEFT, padx=(8, 0))
+
         self.aec_reduction_label = ttk.Label(panel, textvariable=self.aec_reduction_var,
                                              font=("TkDefaultFont", 11, "bold"))
         self.aec_reduction_label.pack(anchor=tk.W, pady=(8, 0))
-        ttk.Label(panel, text="hybrid = NKF→DTLN (deep + voice kept) · dtln = deep/wavy · "
+        ttk.Label(panel, text="hybrid_localvqe = hybrid + LocalVQE (residual scrubbed) · "
+                              "hybrid = NKF→DTLN (deep + voice kept) · dtln = deep/wavy · "
                               "nkf = clean/shallow · nlms = linear baseline",
                   foreground="#9aa4b2").pack(anchor=tk.W)
 
@@ -336,7 +347,11 @@ class CleanSpeechTestbed(tk.Tk):
         self._send_control({
             "echo_canceller": self.model_var.get(),
             "dtln_mask_smoothing": float(self.mask_smooth_var.get()),
+            "localvqe_blend": float(self.localvqe_blend_var.get()),
         })
+
+    def _set_blend(self) -> None:
+        self._send_control({"localvqe_blend": float(self.localvqe_blend_var.get())})
 
     def _build_alignment_panel(self, outer: ttk.Frame) -> None:
         align = ttk.LabelFrame(outer, text="Echo Alignment (live tuning via control socket)", padding=10)
@@ -617,8 +632,13 @@ class CleanSpeechTestbed(tk.Tk):
             active = config.get("echo_canceller", "?")
             swap = config.get("echo_swap_status", "")
             smooth = config.get("dtln_mask_smoothing")
-            smooth_txt = f", smooth={smooth}" if smooth is not None and active in ("dtln", "hybrid") else ""
-            self.aec_active_var.set(f"active model: {active}{smooth_txt}" + (f"  ·  {swap}" if swap and "active" not in swap else ""))
+            blend = config.get("localvqe_blend")
+            extra = ""
+            if smooth is not None and active in ("dtln", "hybrid", "hybrid_localvqe"):
+                extra += f", smooth={smooth}"
+            if blend is not None and active == "hybrid_localvqe":
+                extra += f", blend={blend}"
+            self.aec_active_var.set(f"active model: {active}{extra}" + (f"  ·  {swap}" if swap and "active" not in swap else ""))
             self.diagnostics_var.set(
                 "Diagnostics: "
                 f"mic {fmt_db(mic.get('rms_dbfs'))} peak {fmt_db(mic.get('peak_dbfs'))}, "

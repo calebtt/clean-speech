@@ -49,8 +49,11 @@ class ProcessingConfig:
     #   "dtln"   deep non-linear cancellation, can warble on speech
     #   "nkf"    linear neural Kalman, artifact-free but shallow
     #   "hybrid" NKF->DTLN, deep cancellation with the voice kept clear (recommended)
+    #   "hybrid_localvqe" hybrid blended with LocalVQE (GGML) — scrubs the residual
+    #       reference leakage; localvqe_blend sets how much LocalVQE vs hybrid.
     echo_canceller: str = "nlms"
     dtln_mask_smoothing: float = 0.6  # neural DTLN temporal mask smoothing (less warble)
+    localvqe_blend: float = 0.7  # hybrid_localvqe: 0=hybrid only, 1=LocalVQE only
     echo_filter_taps: int = 4096  # ~85 ms at 48 kHz; long enough for the room tail
     # 0.3 adapts fast enough to remove most of an echo-dominant capture (validated:
     # ~6 dB / 77% of the energy on a real recording, near the ceiling set by the
