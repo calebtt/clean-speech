@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import threading
 
 import numpy as np
 
@@ -390,6 +391,7 @@ class ProcessingPipeline:
         self.mic_delay_buffer = np.zeros(self.mic_delay_samples, dtype=np.float32)
         self.stats = ProcessingStats()
         self.last_stages: dict[str, np.ndarray] = {}
+        self.echo_swap_status = f"active: {config.processing.echo_canceller}"
 
     def process(self, mic: np.ndarray, reference: np.ndarray | None = None) -> np.ndarray:
         frame = np.asarray(mic, dtype=np.float32)
@@ -503,6 +505,31 @@ class ProcessingPipeline:
                 self.mic_delay_buffer = np.zeros(samples, dtype=np.float32)
             applied["mic_delay_ms"] = float(mic_delay_ms)
         return applied
+
+    def set_echo_canceller(self, kind: str | None = None, mask_smooth: float | None = None) -> None:
+        """Hot-swap the echo canceller (e.g. nlms -> hybrid) without restarting.
+
+        Neural cancellers load ONNX/torch models (~1-2 s), so the new canceller is
+        built on a background thread and swapped in atomically when ready; the
+        realtime loop keeps using the current one meanwhile (no audio stall).
+        """
+        if kind is not None:
+            self.config.processing.echo_canceller = kind
+        if mask_smooth is not None:
+            self.config.processing.dtln_mask_smoothing = float(mask_smooth)
+        frame_samples = int(self.config.input.sample_rate * self.config.input.frame_ms / 1000)
+        target = self.config.processing.echo_canceller
+        self.echo_swap_status = f"loading {target}…"
+
+        def _build() -> None:
+            try:
+                new_canceller = make_echo_canceller(self.config, frame_samples)
+                self.echo = new_canceller  # atomic reference swap (GIL)
+                self.echo_swap_status = f"active: {target}"
+            except Exception as exc:  # noqa: BLE001
+                self.echo_swap_status = f"error loading {target}: {exc}"
+
+        threading.Thread(target=_build, name="echo-canceller-swap", daemon=True).start()
 
     def reset_echo_filter(self) -> None:
         reset = getattr(self.echo, "reset", None)

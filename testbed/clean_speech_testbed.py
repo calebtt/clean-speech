@@ -235,6 +235,13 @@ class CleanSpeechTestbed(tk.Tk):
         self.align_verdict_var = tk.StringVar(value="Verdict: waiting...")
         self.align_verdict_label: ttk.Label | None = None
 
+        # Live AEC model switcher + effectiveness readout.
+        self.model_var = tk.StringVar(value="hybrid")
+        self.mask_smooth_var = tk.DoubleVar(value=0.6)
+        self.aec_active_var = tk.StringVar(value="active model: (waiting for daemon)")
+        self.aec_reduction_var = tk.StringVar(value="echo removed (mic → after_echo): -- dB")
+        self.aec_reduction_label: ttk.Label | None = None
+
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(40, self._pump_audio)
@@ -262,6 +269,7 @@ class CleanSpeechTestbed(tk.Tk):
         ttk.Entry(row2, textvariable=self.control_socket_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
         ttk.Button(row2, text="Workflow / Help", command=self.show_instructions).pack(side=tk.LEFT)
 
+        self._build_aec_model_panel(outer)
         self._build_alignment_panel(outer)
 
         meters = ttk.LabelFrame(outer, text="Stream Overview", padding=10)
@@ -301,6 +309,34 @@ class CleanSpeechTestbed(tk.Tk):
         diagnostics = ttk.LabelFrame(outer, text="Daemon Diagnostics", padding=10)
         diagnostics.pack(fill=tk.X, pady=(12, 0))
         ttk.Label(diagnostics, textvariable=self.diagnostics_var, justify=tk.LEFT).pack(anchor=tk.W)
+
+    def _build_aec_model_panel(self, outer: ttk.Frame) -> None:
+        panel = ttk.LabelFrame(outer, text="AEC Model (live switch via control socket)", padding=10)
+        panel.pack(fill=tk.X, pady=(12, 0))
+
+        row = ttk.Frame(panel)
+        row.pack(fill=tk.X)
+        ttk.Label(row, text="Canceller").pack(side=tk.LEFT)
+        ttk.Combobox(row, textvariable=self.model_var, state="readonly", width=9,
+                     values=("hybrid", "dtln", "nkf", "nlms", "scalar")).pack(side=tk.LEFT, padx=(4, 14))
+        ttk.Label(row, text="DTLN mask smoothing").pack(side=tk.LEFT)
+        ttk.Spinbox(row, from_=0.0, to=0.95, increment=0.05, width=5,
+                    textvariable=self.mask_smooth_var, format="%.2f").pack(side=tk.LEFT, padx=(4, 14))
+        ttk.Button(row, text="Apply Model", command=self._apply_model).pack(side=tk.LEFT)
+        ttk.Label(row, textvariable=self.aec_active_var, foreground="#9aa4b2").pack(side=tk.RIGHT)
+
+        self.aec_reduction_label = ttk.Label(panel, textvariable=self.aec_reduction_var,
+                                             font=("TkDefaultFont", 11, "bold"))
+        self.aec_reduction_label.pack(anchor=tk.W, pady=(8, 0))
+        ttk.Label(panel, text="hybrid = NKF→DTLN (deep + voice kept) · dtln = deep/wavy · "
+                              "nkf = clean/shallow · nlms = linear baseline",
+                  foreground="#9aa4b2").pack(anchor=tk.W)
+
+    def _apply_model(self) -> None:
+        self._send_control({
+            "echo_canceller": self.model_var.get(),
+            "dtln_mask_smoothing": float(self.mask_smooth_var.get()),
+        })
 
     def _build_alignment_panel(self, outer: ttk.Frame) -> None:
         align = ttk.LabelFrame(outer, text="Echo Alignment (live tuning via control socket)", padding=10)
@@ -411,6 +447,14 @@ class CleanSpeechTestbed(tk.Tk):
             rms_ratio = echo_rms / mic_rms
             self.align_residual_var.set(f"after_echo vs reference: {abs(residual_corr):.3f}  (lower = more removed)")
             self.align_diverge_var.set(f"after_echo / mic level: {db(rms_ratio):+.1f} dB  (want <= 0)")
+            # Headline AEC effectiveness: how much echo energy was removed.
+            removed_db = -db(rms_ratio)
+            self.aec_reduction_var.set(
+                f"echo removed (mic → after_echo): {removed_db:+.1f} dB   ·   residual vs ref {abs(residual_corr):.3f}"
+            )
+            if self.aec_reduction_label is not None:
+                color = "#86efac" if removed_db >= 6.0 else ("#fbbf24" if removed_db >= 1.0 else "#fb7185")
+                self.aec_reduction_label.configure(foreground=color)
         else:
             self.align_residual_var.set("after_echo vs reference: --")
             self.align_diverge_var.set("after_echo / mic level: --")
@@ -570,6 +614,11 @@ class CleanSpeechTestbed(tk.Tk):
             config = payload.get("config", {})
             reader = config.get("reference_reader", {})
             stages = payload.get("stages", {})
+            active = config.get("echo_canceller", "?")
+            swap = config.get("echo_swap_status", "")
+            smooth = config.get("dtln_mask_smoothing")
+            smooth_txt = f", smooth={smooth}" if smooth is not None and active in ("dtln", "hybrid") else ""
+            self.aec_active_var.set(f"active model: {active}{smooth_txt}" + (f"  ·  {swap}" if swap and "active" not in swap else ""))
             self.diagnostics_var.set(
                 "Diagnostics: "
                 f"mic {fmt_db(mic.get('rms_dbfs'))} peak {fmt_db(mic.get('peak_dbfs'))}, "

@@ -193,6 +193,14 @@ class CleanSpeechDaemon:
             self.ref_sync.set_target_latency_frames(sync_frames)
             self.config.processing.reference_sync_latency_frames = sync_frames
             tuning["reference_sync_latency_frames"] = sync_frames
+        echo_canceller = _as_optional_str(command.get("echo_canceller"))
+        mask_smooth = _as_optional_float(command.get("dtln_mask_smoothing"))
+        if echo_canceller is not None or mask_smooth is not None:
+            self.pipeline.set_echo_canceller(kind=echo_canceller, mask_smooth=mask_smooth)
+            if echo_canceller is not None:
+                tuning["echo_canceller"] = echo_canceller
+            if mask_smooth is not None:
+                tuning["dtln_mask_smoothing"] = mask_smooth
         if bool(command.get("reset_echo_filter")):
             self.pipeline.reset_echo_filter()
             tuning["reset_echo_filter"] = True
@@ -228,6 +236,8 @@ class CleanSpeechDaemon:
                     "enable_reference_level_match": self.config.processing.enable_reference_level_match,
                     "enable_echo_cancellation": self.config.processing.enable_echo_cancellation,
                     "echo_canceller": self.config.processing.echo_canceller,
+                    "echo_swap_status": getattr(self.pipeline, "echo_swap_status", ""),
+                    "dtln_mask_smoothing": getattr(self.config.processing, "dtln_mask_smoothing", None),
                     "echo_filter_taps": self.config.processing.echo_filter_taps,
                     "echo_step_size": self.config.processing.echo_step_size,
                     "echo_filter_leak": self.config.processing.echo_filter_leak,

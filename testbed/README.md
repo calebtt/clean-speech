@@ -25,6 +25,26 @@ Use it to:
 7. View daemon diagnostics from `/tmp/clean-speech-daemon-status.json`.
 8. Generate an `alignment_report.json` when saving streams, with estimated stream offsets against `mic_raw`.
 
+## AEC Model panel
+
+Switch the echo canceller **live** (no daemon restart) and see how well it's working:
+
+- **Canceller** dropdown — `hybrid` (NKF→DTLN: deep cancellation, voice kept),
+  `dtln` (deep but can warble), `nkf` (clean but shallow/linear), `nlms` (linear
+  baseline), `scalar` (legacy). **Apply Model** pushes it over the control socket;
+  the daemon loads the new model on a background thread and swaps it in atomically,
+  so there's no audio stall.
+- **DTLN mask smoothing** — reduces the "wavy"/musical-noise artifact for `dtln`
+  and `hybrid` (0.6 default; higher = smoother, slightly less suppression).
+- **active model: …** — the model the daemon is actually running (from its status),
+  including a `loading …` indicator during a swap.
+- **echo removed (mic → after_echo)** — the headline effectiveness number, computed
+  live from the streams: how much echo energy the canceller removed, plus the
+  residual correlation with the reference. Green ≥6 dB, amber ≥1 dB, red below.
+
+A/B workflow: pick a model, press **Apply Model**, watch the *echo removed* readout
+and listen (set Play stream = `after_echo`), then try another. No restart needed.
+
 ## Echo Alignment panel
 
 The **Echo Alignment** panel tunes the echo canceller live (over the control

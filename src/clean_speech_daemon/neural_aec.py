@@ -34,6 +34,12 @@ _WIN = np.hanning(NFFT + 1)[:-1].astype(np.float64)  # periodic Hann (matches to
 _WOLA_C = 1.5  # sum of squared periodic-Hann at 4x overlap (hop=256, win=1024)
 DTLN_BLOCK = 512
 DTLN_SHIFT = 128
+# Divergence guard: clamp the NKF filter-state magnitude. Normal operation keeps
+# it around 7-21 (even on loud input), while a runaway shoots to 1e5+. Clamping at
+# 50 is well above any normal value -- so it never alters normal output -- yet reins
+# in a runaway before it becomes a (clipped) full-scale buzz. A soft clamp is far
+# less disruptive than resetting the filter (which would drop cancellation entirely).
+NKF_STATE_BOUND = 50.0
 
 
 # --------------------------------------------------------------------------- #
@@ -186,6 +192,13 @@ class StreamingNkf:
                 with torch.no_grad():
                     kg = self.kg(torch.from_numpy(feat)).squeeze(-1).numpy()
                 self._hpos = self._hpri + kg * e[:, None]
+                # Divergence guard: clamp the filter-state magnitude (and scrub any
+                # non-finite values). Above-normal only -> normal cancellation is
+                # untouched; a runaway is reined in continuously, no reset needed.
+                self._hpos = np.nan_to_num(self._hpos)
+                hmag = float(np.max(np.abs(self._hpos)))
+                if hmag > NKF_STATE_BOUND:
+                    self._hpos *= NKF_STATE_BOUND / hmag
                 S = Y - np.sum(self._xt * self._hpos, axis=1)
             self._ola += np.fft.irfft(S) * _WIN
             out.append((self._ola[:HOP] / _WOLA_C).astype(np.float32).copy())
@@ -245,6 +258,8 @@ class NeuralEchoCanceller:
             clean16 = self._dtln.process(residual, ref_aligned) if m else np.zeros(0, np.float32)
 
         if len(clean16):
+            # Final NaN/Inf defense before the audio leaves the canceller.
+            clean16 = np.clip(np.nan_to_num(clean16, nan=0.0, posinf=1.5, neginf=-1.5), -1.5, 1.5)
             self._out48 = np.concatenate([self._out48, self._rs_out.resample_chunk(clean16)])
             mr = float(np.sqrt(np.mean(mic16 * mic16)) + 1e-9) if len(mic16) else 1.0
             cr = float(np.sqrt(np.mean(clean16 * clean16)) + 1e-9)
