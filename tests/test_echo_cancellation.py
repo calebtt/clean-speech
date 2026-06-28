@@ -69,6 +69,9 @@ def base_echo_config() -> Config:
     # Synthetic mic/reference are sample-aligned here, so cancel the shipped
     # default mic delay (which exists to restore causality on live captures).
     config.processing.mic_delay_ms = 0
+    # Pipeline tests exercise the adaptive NLMS canceller; pin it so they stay
+    # independent of the shipped hybrid_localvqe default.
+    config.processing.echo_canceller = "nlms"
     # Strong step to exercise full convergence on clean synthetic echo (matches the
     # shipped default; pinned so these tests are independent of default changes).
     config.processing.echo_step_size = 0.3

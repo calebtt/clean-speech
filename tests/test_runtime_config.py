@@ -26,10 +26,10 @@ def load_testbed_module():  # noqa: ANN201
 
 
 class RuntimeConfigRegressionTests(unittest.TestCase):
-    def test_default_echo_canceller_is_nlms(self) -> None:
+    def test_default_echo_canceller_is_hybrid_localvqe(self) -> None:
         config = Config()
 
-        self.assertEqual(config.processing.echo_canceller, "nlms")
+        self.assertEqual(config.processing.echo_canceller, "hybrid_localvqe")
         self.assertTrue(config.processing.enable_reference_delay_align)
         self.assertFalse(config.processing.enable_reference_level_match)
         # 60 ms is the shipped default: it restores AEC causality (the parec monitor
@@ -37,7 +37,7 @@ class RuntimeConfigRegressionTests(unittest.TestCase):
         self.assertEqual(config.processing.mic_delay_ms, 60)
         self.assertGreaterEqual(config.processing.echo_filter_taps, 512)
 
-    def test_old_config_without_echo_canceller_still_uses_nlms(self) -> None:
+    def test_old_config_without_echo_canceller_uses_shipped_default(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.toml"
             path.write_text(
@@ -53,11 +53,18 @@ enable_echo_cancellation = true
 
             config = load_config(path)
 
-        self.assertEqual(config.processing.echo_canceller, "nlms")
+        self.assertEqual(config.processing.echo_canceller, "hybrid_localvqe")
 
-    def test_echo_profiles_are_explicitly_nlms(self) -> None:
+    def test_example_config_uses_hybrid_localvqe_default(self) -> None:
         root = Path(__file__).resolve().parents[1]
-        for relative in ("config.example.toml", "profiles/echo-vad.toml", "profiles/stage-wav-debug.toml", "profiles/nlms-aec.toml"):
+        profile = tomllib.loads((root / "config.example.toml").read_text(encoding="utf-8"))
+        processing = profile["processing"]
+        self.assertEqual(processing["echo_canceller"], "hybrid_localvqe")
+        self.assertGreaterEqual(processing["echo_filter_taps"], 4096)
+
+    def test_nlms_profiles_remain_explicitly_nlms(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        for relative in ("profiles/echo-vad.toml", "profiles/stage-wav-debug.toml", "profiles/nlms-aec.toml"):
             with self.subTest(profile=relative):
                 profile = tomllib.loads((root / relative).read_text(encoding="utf-8"))
                 processing = profile["processing"]
