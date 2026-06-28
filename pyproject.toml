@@ -25,6 +25,17 @@ dependencies = [
   "soundfile>=0.12",
 ]
 
+# Extras for the neural echo cancellers (dtln/nkf/hybrid/hybrid_localvqe), which is the default.
+# The bundled LocalVQE GGML libs/model ship in lib/ and models/ and need no pip package.
+# Install with: pip install -e '.[neural]'
+[project.optional-dependencies]
+neural = [
+  "onnxruntime>=1.16",
+  "soxr>=0.3",
+  "torch>=2.0",
+  "torchlibrosa>=0.1",
+]
+
 [project.urls]
 Homepage = "https://github.com/calebtt/clean-speech"
 Repository = "https://github.com/calebtt/clean-speech"

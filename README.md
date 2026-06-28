@@ -26,10 +26,12 @@ It captures webcam microphone audio, applies high-pass filtering, adaptive and n
 
 ## Requirements
 
-- Linux with PipeWire (PipeWire-Pulse) or PulseAudio
+- Linux **x86-64** with PipeWire (PipeWire-Pulse) or PulseAudio
 - Python 3.11+
 - `pactl` for the virtual microphone (usually preinstalled)
-- The neural echo cancellers additionally require `onnxruntime` (DTLN) and PyTorch (NKF)
+- The default `hybrid_localvqe` echo canceller needs the neural extras (`pip install -e '.[neural]'`:
+  onnxruntime, soxr, torch). The bundled LocalVQE GGML libs/model (`lib/`, `models/`) are x86-64 only.
+  Without the extras the daemon falls back to the dependency-free `nlms` canceller.
 
 ## Quick Start
 
@@ -150,18 +152,19 @@ This implementation is a local, testable daemon with no GUI dependency. It uses 
 
 Real desktop-speaker echo reaches the mic delayed and filtered by the room, so a single per-frame gain cannot remove it. Several backends are available via `processing.echo_canceller`:
 
-**Adaptive / classical:**
+**Neural** (`neural_aec.py`, 16 kHz models wrapped behind the same per-frame interface; ~100 ms priming latency). These need the neural extras — `pip install -e '.[neural]'` (onnxruntime, soxr, torch) — plus the bundled GGML libs/model in `lib/` and `models/`:
 
-- `"nlms"` (recommended default): a frequency-domain (overlap-save) multi-tap **adaptive filter** (`aec.py`) that learns the room impulse response and tracks slow changes. On broadband system audio convolved with a room response it clears ~90–95% of the echo. Tunables: `echo_filter_taps` (filter length in samples), `echo_step_size` (raise toward `0.6` to track clock drift faster), `echo_filter_leak`.
-- `"scalar"`: the legacy single-gain reducer. Only effective when the echo is a perfectly time-aligned, unfiltered copy of the reference; kept for back-compat.
-
-**Neural** (`neural_aec.py`, 16 kHz models wrapped behind the same per-frame interface; ~100 ms priming latency):
-
+- `"hybrid_localvqe"` **(default)**: the `hybrid` chain (NKF → DTLN) blended with **LocalVQE** (a small GGML model run via the bundled `liblocalvqe.so`) to scrub residual reference leakage. Best quality; `localvqe_blend` sets LocalVQE-vs-hybrid mix.
+- `"hybrid"`: NKF → DTLN. NKF removes the linear echo first so DTLN only suppresses the weak non-linear residual.
 - `"dtln"`: DTLN-aec (ONNX). Deep non-linear cancellation; can warble on speech.
 - `"nkf"`: NKF-AEC (neural Kalman, PyTorch). Linear and artifact-free but shallower.
-- `"hybrid"`: NKF → DTLN. NKF removes the linear echo first so DTLN only suppresses the weak non-linear residual — deep cancellation with clear voice. The recommended neural setting.
 
-`make_echo_canceller` is the seam for dropping in a native WebRTC/Speex AEC behind the same interface. Try `profiles/nlms-aec.toml` for the adaptive path.
+**Adaptive / classical** (no extra deps):
+
+- `"nlms"`: a frequency-domain (overlap-save) multi-tap **adaptive filter** (`aec.py`) that learns the room impulse response. Clears ~90–95% of broadband echo. The automatic fallback if the neural extras/models are unavailable. Tunables: `echo_filter_taps`, `echo_step_size` (raise toward `0.6` to track clock drift faster), `echo_filter_leak`.
+- `"scalar"`: the legacy single-gain reducer; kept for back-compat.
+
+If the configured neural backend can't load (missing extras, models, or libs), the daemon logs a warning and falls back to `"nlms"` rather than failing to start. `make_echo_canceller` is the seam for dropping in a native WebRTC/Speex AEC behind the same interface.
 
 ## Clock-Drift Synchronisation
 

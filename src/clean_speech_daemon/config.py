@@ -51,7 +51,7 @@ class ProcessingConfig:
     #   "hybrid" NKF->DTLN, deep cancellation with the voice kept clear (recommended)
     #   "hybrid_localvqe" hybrid blended with LocalVQE (GGML) — scrubs the residual
     #       reference leakage; localvqe_blend sets how much LocalVQE vs hybrid.
-    echo_canceller: str = "nlms"
+    echo_canceller: str = "hybrid_localvqe"
     dtln_mask_smoothing: float = 0.6  # neural DTLN temporal mask smoothing (less warble)
     localvqe_blend: float = 0.7  # hybrid_localvqe: 0=hybrid only, 1=LocalVQE only
     echo_filter_taps: int = 4096  # ~85 ms at 48 kHz; long enough for the room tail
@@ -194,7 +194,7 @@ delay_fine_tune_ms = 15
 delay_target_residual_corr = 0.15
 enable_reference_level_match = false
 enable_echo_cancellation = true
-echo_canceller = "nlms"
+echo_canceller = "hybrid_localvqe"
 echo_filter_taps = 4096
 echo_step_size = 0.3
 echo_filter_leak = 0.0001

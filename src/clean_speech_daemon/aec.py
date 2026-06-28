@@ -164,7 +164,8 @@ def make_echo_canceller(config, frame_samples: int):  # noqa: ANN001
     from .processing import AdaptiveEchoReducer
 
     kind = getattr(config.processing, "echo_canceller", "scalar")
-    if kind == "nlms":
+
+    def _nlms():
         return NlmsEchoCanceller(
             frame_samples,
             taps=int(getattr(config.processing, "echo_filter_taps", 512)),
@@ -174,15 +175,31 @@ def make_echo_canceller(config, frame_samples: int):  # noqa: ANN001
             step_size_warmup=float(getattr(config.processing, "echo_step_size_warmup", 0.3)),
             warmup_frames=int(getattr(config.processing, "echo_warmup_frames", 150)),
         )
+
+    if kind == "nlms":
+        return _nlms()
     if kind in ("dtln", "nkf", "hybrid", "hybrid_localvqe"):
         # Neural cancellers (16 kHz models wrapped for the 48 kHz realtime loop).
-        from .neural_aec import NeuralEchoCanceller
+        # These need extra deps (onnxruntime, soxr, torch) and bundled models/libs; if any are
+        # missing, degrade gracefully to the adaptive NLMS filter rather than crash on startup.
+        try:
+            from .neural_aec import NeuralEchoCanceller
 
-        return NeuralEchoCanceller(
-            kind,
-            frame_samples,
-            sample_rate=int(config.input.sample_rate),
-            mask_smooth=float(getattr(config.processing, "dtln_mask_smoothing", 0.6)),
-            localvqe_blend=float(getattr(config.processing, "localvqe_blend", 0.7)),
-        )
+            return NeuralEchoCanceller(
+                kind,
+                frame_samples,
+                sample_rate=int(config.input.sample_rate),
+                mask_smooth=float(getattr(config.processing, "dtln_mask_smoothing", 0.6)),
+                localvqe_blend=float(getattr(config.processing, "localvqe_blend", 0.7)),
+            )
+        except Exception as exc:  # noqa: BLE001 - missing deps/models/libs -> safe fallback
+            import sys
+
+            print(
+                f"[clean-speech-daemon] echo_canceller '{kind}' unavailable ({exc}); "
+                "falling back to 'nlms'. Install neural deps with: pip install -e '.[neural]'",
+                file=sys.stderr,
+                flush=True,
+            )
+            return _nlms()
     return AdaptiveEchoReducer()
