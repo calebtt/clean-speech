@@ -1,14 +1,35 @@
 # Clean Speech Daemon
 
-Standalone Ubuntu microphone cleanup service for GUI testbeds and other local clients.
+Standalone Linux microphone-cleanup service for voice agents, GUI testbeds, and other local clients.
 
-It captures webcam microphone audio, applies high-pass filtering, adaptive echo/reference reduction when a reference input is configured, spectral noise suppression, speech activity gating, and publishes the cleaned stream through:
+It captures webcam microphone audio, applies high-pass filtering, adaptive and neural echo/reference reduction when a reference input is configured, spectral noise suppression, and speech-activity gating, then publishes the cleaned stream through:
 
 1. A PulseAudio/PipeWire virtual source named `Clean Speech Microphone`
 2. A Unix socket at `/tmp/clean-speech-daemon.sock`
 3. A multi-stream Unix socket at `/tmp/clean-speech-daemon-streams.sock`
 4. A raw PCM FIFO at `/tmp/clean-speech-daemon.pcm`
 5. An optional debug WAV file
+
+> **Status:** working prototype. The I/O, daemon, socket, FIFO, config, and service interfaces
+> are stable; the DSP/model stages are still being tuned. See [Quality Notes](#quality-notes).
+
+## Features
+
+- Acoustic echo cancellation against the **system playback monitor**, so it removes all speaker
+  output (not just one app's audio) leaking into the mic. Adaptive (NLMS) and neural (DTLN / NKF /
+  hybrid) backends are selectable.
+- Spectral noise suppression and speech-activity gating with configurable pre/post-roll.
+- Clock-drift compensation between the mic and the playback monitor.
+- Multiple outputs: a virtual microphone, a raw PCM socket, a multi-stream diagnostic socket, a
+  FIFO, and optional debug WAVs.
+- Runtime diagnostics and ready-to-copy tuning profiles.
+
+## Requirements
+
+- Linux with PipeWire (PipeWire-Pulse) or PulseAudio
+- Python 3.11+
+- `pactl` for the virtual microphone (usually preinstalled)
+- The neural echo cancellers additionally require `onnxruntime` (DTLN) and PyTorch (NKF)
 
 ## Quick Start
 
@@ -127,12 +148,20 @@ This implementation is a local, testable daemon with no GUI dependency. It uses 
 
 ## Echo Cancellation (`echo_canceller`)
 
-Real desktop-speaker echo reaches the mic delayed and filtered by the room, so a single per-frame gain cannot remove it. Two backends are available via `processing.echo_canceller`:
+Real desktop-speaker echo reaches the mic delayed and filtered by the room, so a single per-frame gain cannot remove it. Several backends are available via `processing.echo_canceller`:
+
+**Adaptive / classical:**
 
 - `"nlms"` (recommended default): a frequency-domain (overlap-save) multi-tap **adaptive filter** (`aec.py`) that learns the room impulse response and tracks slow changes. On broadband system audio convolved with a room response it clears ~90–95% of the echo. Tunables: `echo_filter_taps` (filter length in samples), `echo_step_size` (raise toward `0.6` to track clock drift faster), `echo_filter_leak`.
 - `"scalar"`: the legacy single-gain reducer. Only effective when the echo is a perfectly time-aligned, unfiltered copy of the reference; kept for back-compat.
 
-`make_echo_canceller` is the seam for dropping in a native WebRTC/Speex AEC behind the same interface. The current default gives NLMS a wide tap window and avoids frame-quantized reference delay and scalar reference level matching before the adaptive filter. Try `profiles/nlms-aec.toml`.
+**Neural** (`neural_aec.py`, 16 kHz models wrapped behind the same per-frame interface; ~100 ms priming latency):
+
+- `"dtln"`: DTLN-aec (ONNX). Deep non-linear cancellation; can warble on speech.
+- `"nkf"`: NKF-AEC (neural Kalman, PyTorch). Linear and artifact-free but shallower.
+- `"hybrid"`: NKF → DTLN. NKF removes the linear echo first so DTLN only suppresses the weak non-linear residual — deep cancellation with clear voice. The recommended neural setting.
+
+`make_echo_canceller` is the seam for dropping in a native WebRTC/Speex AEC behind the same interface. Try `profiles/nlms-aec.toml` for the adaptive path.
 
 ## Clock-Drift Synchronisation
 
@@ -255,9 +284,12 @@ clean-speech-daemon status
 
 ## Important Paths
 
-1. Project: `/home/caleb/clean-speech-daemon`
-2. Config: `~/.config/clean-speech-daemon/config.toml`
-3. Socket: `/tmp/clean-speech-daemon.sock`
-4. Multi-stream socket: `/tmp/clean-speech-daemon-streams.sock`
-5. FIFO: `/tmp/clean-speech-daemon.pcm`
-6. systemd unit: `systemd/clean-speech-daemon.service`
+1. Config: `~/.config/clean-speech-daemon/config.toml`
+2. Socket: `/tmp/clean-speech-daemon.sock`
+3. Multi-stream socket: `/tmp/clean-speech-daemon-streams.sock`
+4. FIFO: `/tmp/clean-speech-daemon.pcm`
+5. systemd unit: `systemd/clean-speech-daemon.service`
+
+## License
+
+Released under the [MIT License](LICENSE).
