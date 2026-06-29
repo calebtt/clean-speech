@@ -7,10 +7,10 @@ Why this exists
 the NLMS canceller is deterministic, so replaying the saved ``mic_raw`` +
 ``system_reference`` frames through :class:`ProcessingPipeline` reproduces
 ``after_echo`` bit-for-bit. That makes this the right tool for iterating the
-delay-align / NLMS / boundary fixes (FIX_PROPOSALS hypotheses 2-4): change a knob,
+delay-align / NLMS / boundary fixes: change a knob,
 re-run, read the success-criteria metrics -- no re-recording, no live mic.
 
-It does NOT exercise the reference jitter buffer (sync, hypothesis 1): the saved
+It does NOT exercise the reference jitter buffer (sync): the saved
 reference is already post-sync. Validate sync live via the underrun/resync
 counters; validate everything downstream here.
 

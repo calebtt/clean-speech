@@ -2,11 +2,10 @@
 
 Separate GUI client for testing the background `clean-speech-daemon` output.
 
-Run it with:
+Run it from the repo root:
 
 ```bash
-cd /home/caleb/clean-speech-testbed
-python3 clean_speech_testbed.py
+python3 testbed/clean_speech_testbed.py
 ```
 
 The GUI connects to:
