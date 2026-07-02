@@ -1,0 +1,32 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # libportaudio2/libsndfile1 back sounddevice/soundfile (core deps); python3-tk
+      # is needed to import testbed/clean_speech_testbed.py, which some tests load
+      # for its pure-numpy helper functions.
+      - name: Install system audio/GUI libs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libportaudio2 libsndfile1 python3-tk
+
+      - name: Install package and test deps
+        run: pip install -e ".[test]"
+
+      - name: Run tests
+        run: pytest -q

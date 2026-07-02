@@ -35,6 +35,10 @@ neural = [
   "torch>=2.0",
   "torchlibrosa>=0.1",
 ]
+test = [
+  "pytest>=7.0",
+  "scipy>=1.10",
+]
 
 [project.urls]
 Homepage = "https://github.com/calebtt/clean-speech"
