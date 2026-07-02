@@ -16,7 +16,9 @@ from clean_speech_daemon.processing import ProcessingPipeline
 
 
 def load_testbed_module():  # noqa: ANN201
-    path = Path("/home/caleb/clean-speech-testbed/clean_speech_testbed.py")
+    # The repo's own vendored copy, not an absolute path into a sibling checkout
+    # on one machine -- that broke this test on every other clone/CI runner.
+    path = Path(__file__).resolve().parents[1] / "testbed" / "clean_speech_testbed.py"
     spec = importlib.util.spec_from_file_location("clean_speech_testbed_runtime_tests", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

@@ -131,7 +131,13 @@ class CleanSpeechDaemon:
 
             while not self.stop_requested:
                 self._poll_control_commands()
-                mic_frame = mic.read(timeout=0.5)
+                try:
+                    mic_frame = mic.read(timeout=0.5)
+                except Empty:
+                    # No mic frame arrived within the timeout (brief device hiccup,
+                    # PortAudio underrun, USB glitch). Keep the daemon alive and
+                    # re-check stop_requested/control commands rather than crashing.
+                    continue
                 ref_data = None
                 if reference is not None:
                     # Drain everything the monitor produced since the last mic frame

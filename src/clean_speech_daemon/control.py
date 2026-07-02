@@ -9,6 +9,13 @@ import threading
 from queue import Queue
 from typing import Callable
 
+from .config import validate_control_command
+
+# A connected client that sends nothing (or nothing terminated by '\n') would
+# otherwise block recv() forever on this single-threaded server, wedging the
+# control socket for every other client until that connection is killed.
+_CLIENT_RECV_TIMEOUT = 5.0
+
 
 class ControlServer:
     def __init__(self, socket_path: str, command_queue: Queue[dict[str, object]]) -> None:
@@ -53,17 +60,33 @@ class ControlServer:
                 continue
             except OSError:
                 break
-            with client:
-                try:
-                    payload = self._read_json_line(client)
-                    if isinstance(payload, dict):
+            client.settimeout(_CLIENT_RECV_TIMEOUT)
+            # Handle each connection on its own thread: this loop used to process
+            # clients one at a time inline, so even with a recv timeout a single
+            # slow/silent client would stall every other client behind it for up
+            # to that timeout. A thread per connection means a stuck client only
+            # blocks itself.
+            threading.Thread(target=self._handle_client, args=(client,), daemon=True).start()
+
+    def _handle_client(self, client: socket.socket) -> None:
+        with client:
+            try:
+                payload = self._read_json_line(client)
+                if isinstance(payload, dict):
+                    error = validate_control_command(payload)
+                    if error is not None:
+                        response = {"ok": False, "error": error}
+                    else:
                         self.command_queue.put(payload)
                         response = {"ok": True, "queued": True}
-                    else:
-                        response = {"ok": False, "error": "expected JSON object"}
-                except Exception as exc:  # noqa: BLE001
-                    response = {"ok": False, "error": str(exc)}
+                else:
+                    response = {"ok": False, "error": "expected JSON object"}
+            except Exception as exc:  # noqa: BLE001
+                response = {"ok": False, "error": str(exc)}
+            try:
                 client.sendall((json.dumps(response) + "\n").encode("utf-8"))
+            except OSError:
+                pass  # client disconnected/timed out before we could reply
 
     @staticmethod
     def _read_json_line(client: socket.socket) -> object:
