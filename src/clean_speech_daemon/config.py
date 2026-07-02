@@ -2,10 +2,24 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import sys
 import tomllib
 
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "clean-speech-daemon" / "config.toml"
+
+# Recognized values for string fields that fall back silently on a typo (see
+# aec.make_echo_canceller / VadGate.process) -- validated at load time so a
+# misspelled value gets a warning instead of quietly behaving like something else.
+ECHO_CANCELLER_CHOICES = frozenset(
+    {"scalar", "nlms", "webrtc_aec3", "aec3", "dtln", "nkf", "hybrid", "hybrid_localvqe"}
+)
+REFERENCE_DELAY_MODE_CHOICES = frozenset({"manual", "auto", "calibrate"})
+OUTPUT_WHEN_NO_SPEECH_CHOICES = frozenset({"silence", "attenuate"})
+
+
+class ConfigError(Exception):
+    """Raised for a config file that cannot be parsed at all (bad TOML syntax)."""
 
 
 @dataclass(slots=True)
@@ -137,11 +151,35 @@ class Config:
     diagnostics: DiagnosticsConfig = field(default_factory=DiagnosticsConfig)
 
 
-def _merge_dataclass(instance: object, values: dict[str, object]) -> None:
+def _merge_dataclass(instance: object, values: dict[str, object], section: str) -> None:
     field_names = getattr(instance, "__dataclass_fields__", {})
     for key, value in values.items():
         if key in field_names:
             setattr(instance, key, value)
+        else:
+            print(
+                f"[clean-speech-daemon] warning: unknown config key '{section}.{key}' ignored "
+                "(check for a typo)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def _validate_config(config: Config) -> None:
+    checks = (
+        ("processing.echo_canceller", config.processing.echo_canceller, ECHO_CANCELLER_CHOICES),
+        ("processing.reference_delay_mode", config.processing.reference_delay_mode, REFERENCE_DELAY_MODE_CHOICES),
+        ("processing.output_when_no_speech", config.processing.output_when_no_speech, OUTPUT_WHEN_NO_SPEECH_CHOICES),
+    )
+    for name, value, choices in checks:
+        if value not in choices:
+            print(
+                f"[clean-speech-daemon] warning: {name} = {value!r} is not one of "
+                f"{sorted(choices)}; falling back to default-like behavior rather than "
+                "the value you configured",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def load_config(path: Path | None = None) -> Config:
@@ -151,20 +189,38 @@ def load_config(path: Path | None = None) -> Config:
         return config
 
     with config_path.open("rb") as file:
-        raw = tomllib.load(file)
+        try:
+            raw = tomllib.load(file)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"failed to parse config file {config_path}: {exc}") from exc
 
     if isinstance(raw.get("input"), dict):
-        _merge_dataclass(config.input, raw["input"])
+        _merge_dataclass(config.input, raw["input"], "input")
     if isinstance(raw.get("processing"), dict):
-        _merge_dataclass(config.processing, raw["processing"])
+        _merge_dataclass(config.processing, raw["processing"], "processing")
     if isinstance(raw.get("vad"), dict):
-        _merge_dataclass(config.vad, raw["vad"])
+        _merge_dataclass(config.vad, raw["vad"], "vad")
     if isinstance(raw.get("output"), dict):
-        _merge_dataclass(config.output, raw["output"])
+        _merge_dataclass(config.output, raw["output"], "output")
     if isinstance(raw.get("diagnostics"), dict):
-        _merge_dataclass(config.diagnostics, raw["diagnostics"])
+        _merge_dataclass(config.diagnostics, raw["diagnostics"], "diagnostics")
 
+    _validate_config(config)
     return config
+
+
+def validate_control_command(payload: dict[str, object]) -> str | None:
+    """Reject a control-socket command with an unrecognized enum value.
+
+    Returns an error string, or None if the command is acceptable to queue.
+    """
+    echo_canceller = payload.get("echo_canceller")
+    if echo_canceller is not None and echo_canceller not in ECHO_CANCELLER_CHOICES:
+        return f"echo_canceller must be one of {sorted(ECHO_CANCELLER_CHOICES)}, got {echo_canceller!r}"
+    delay_mode = payload.get("reference_delay_mode")
+    if delay_mode is not None and delay_mode not in REFERENCE_DELAY_MODE_CHOICES:
+        return f"reference_delay_mode must be one of {sorted(REFERENCE_DELAY_MODE_CHOICES)}, got {delay_mode!r}"
+    return None
 
 
 def default_config_text() -> str:
@@ -201,7 +257,7 @@ echo_filter_leak = 0.0001
 echo_boundary_smoothing_samples = 64
 echo_step_size_warmup = 0.3
 echo_warmup_frames = 150
-reference_sync_latency_frames = 1.0
+reference_sync_latency_frames = 1.5
 reference_drift_compensation = false
 mic_delay_ms = 60
 enable_noise_suppression = true

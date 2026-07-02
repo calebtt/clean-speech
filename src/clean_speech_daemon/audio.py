@@ -1,14 +1,34 @@
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass
 from queue import Empty, Queue
+import signal
 import subprocess
+import sys
 import threading
 import time
 from typing import Iterable
 
 import numpy as np
 import sounddevice as sd
+
+_PR_SET_PDEATHSIG = 1
+
+
+def _die_with_parent() -> None:
+    """preexec_fn for the parec child: ask the kernel to SIGKILL it if this
+    process dies without running its normal __exit__ cleanup (SIGKILL, OOM
+    kill, crash). Without this, a hard kill of the daemon orphans parec, which
+    keeps capturing system audio indefinitely -- a real privacy problem, not
+    just a resource leak."""
+    if sys.platform != "linux":
+        return
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+    except OSError:
+        pass
 
 
 @dataclass(slots=True)
@@ -150,7 +170,9 @@ class PulseMonitorReader:
             # deliver steadily at real-time.
             "--latency-msec=20",
         ]
-        self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=_die_with_parent
+        )
         self.thread = threading.Thread(target=self._read_loop, daemon=True)
         self.thread.start()
         print(f"system audio reference: {source}", flush=True)

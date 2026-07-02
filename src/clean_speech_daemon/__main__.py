@@ -10,7 +10,7 @@ import time
 import soundfile as sf
 
 from .audio import frames_from_socket_bytes, list_input_devices, list_pulse_sources
-from .config import DEFAULT_CONFIG_PATH, default_config_text, load_config
+from .config import DEFAULT_CONFIG_PATH, ConfigError, default_config_text, load_config
 from .daemon import CleanSpeechDaemon
 
 
@@ -40,7 +40,11 @@ def main() -> int:
 
     args = parser.parse_args()
     if args.command in (None, "run"):
-        config = load_config(getattr(args, "config", DEFAULT_CONFIG_PATH))
+        try:
+            config = load_config(getattr(args, "config", DEFAULT_CONFIG_PATH))
+        except ConfigError as exc:
+            print(f"[clean-speech-daemon] {exc}", file=sys.stderr)
+            return 1
         CleanSpeechDaemon(config).run()
         return 0
     if args.command == "devices":
